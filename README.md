@@ -12,19 +12,7 @@ npx shipwarden
 - **Your code stays on your machine.** Nothing is uploaded unless you turn on the optional AI review.
 - **Quiet by design.** A handful of findings you should actually fix, written for founders rather than security teams.
 
-```
- CRITICAL  Row Level Security is off for table profiles
-  supabase/migrations/20250101000000_init.sql:2
-  This table is created without Row Level Security. Supabase serves every table in the public
-  schema through its API, and your anon key is public (it is in your frontend), so anyone can
-  read, change or delete every row in profiles.
-  Fix: Add a migration with alter table public.profiles enable row level security; ...
-
- HIGH  RLS policy lets anyone read, change and delete any row in orders
-  supabase/migrations/20250101000000_init.sql:16
-  using (true) never checks who owns the row, so this policy lets anyone, even logged-out
-  visitors, read, change and delete every row in orders.
-```
+![ShipWarden output on the demo app: two critical findings, a service_role key exposed to the browser and a table with Row Level Security off](docs/screenshot.png)
 
 Try it on the bundled demo: `npx shipwarden examples/vulnerable-demo`
 
