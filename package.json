@@ -1,7 +1,7 @@
 {
   "name": "shipwarden",
-  "version": "0.1.0",
-  "description": "Free security scanner for apps built with Lovable, Bolt, Cursor and v0: Supabase RLS, Firebase rules, leaked keys, unprotected endpoints.",
+  "version": "0.2.0",
+  "description": "Free security scanner and launch checklist for apps built with Lovable, Bolt, Cursor and v0: Supabase RLS, Firebase rules, leaked keys, unprotected endpoints, missing privacy policy and 404 pages.",
   "homepage": "https://github.com/patrickballard/shipwarden#readme",
   "repository": {
     "type": "git",

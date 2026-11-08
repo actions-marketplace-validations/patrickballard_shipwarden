@@ -2,7 +2,8 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { RULES, RULE_IDS } from './rules/index.js';
-import { globToRegExp, severityRank } from './util.js';
+import { runChecklist } from './checklist.js';
+import { TEST_FILE, globToRegExp, severityRank } from './util.js';
 
 const DEFAULT_IGNORES = [
   'node_modules', '.git', '.next', '.nuxt', '.output', '.svelte-kit', '.vercel', '.netlify', '.turbo', '.cache',
@@ -16,8 +17,6 @@ const TEXT_EXT = new Set([
 ]);
 const MAX_BYTES = 1024 * 1024;
 const MAX_SQL_BYTES = 32 * 1024 * 1024; // schema dumps get big
-// Tests and fixtures are full of fake keys and deliberately unsafe code.
-const TEST_FILE = /(^|\/)(__tests__|__mocks__|__fixtures__|tests?|fixtures?|e2e|cypress|spec)\/|\.(test|spec|stories)\.[cm]?[jt]sx?$/;
 
 function walk(root, rel = '', out = []) {
   for (const entry of fs.readdirSync(path.join(root, rel), { withFileTypes: true })) {
@@ -45,6 +44,7 @@ function listFiles(root) {
   }
 }
 
+/** `.shipwardenignore`: path globs, plus `check:<id>` lines that turn off a checklist item. */
 function readIgnoreFile(root) {
   try {
     return fs
@@ -78,7 +78,17 @@ function loadFiles(root, paths, ignores) {
   return files;
 }
 
-function buildContext(files, tracked) {
+function detectKind(deps) {
+  if (deps.has('next')) return 'next';
+  if (deps.has('@sveltejs/kit')) return 'sveltekit';
+  if (deps.has('nuxt')) return 'nuxt';
+  if (deps.has('astro')) return 'astro';
+  if ([...deps].some((d) => d.startsWith('@remix-run/'))) return 'remix';
+  if (deps.has('vite') || deps.has('react-scripts')) return 'spa';
+  return 'other';
+}
+
+function buildContext(files, tracked, paths) {
   const deps = new Set();
   for (const f of files) {
     if (!f.path.endsWith('package.json')) continue;
@@ -94,7 +104,10 @@ function buildContext(files, tracked) {
   const anyPath = (re) => files.some((f) => re.test(f.path));
   const usesSupabase = [...deps].some((d) => d.startsWith('@supabase/')) || anyPath(/(^|\/)supabase\/(config\.toml|migrations\/|functions\/)/);
   const usesFirebase = deps.has('firebase') || deps.has('firebase-admin') || anyPath(/(^|\/)(firebase\.json|firestore\.rules)$/);
-  const framework = deps.has('next') ? 'next' : deps.has('vite') || deps.has('react-scripts') ? 'spa' : 'other';
+  const kind = detectKind(deps);
+  // Only a plain SPA ships everything under src/ to the browser.
+  const framework = kind === 'next' || kind === 'spa' ? kind : 'other';
+  const app = kind !== 'other' || paths.some((p) => /(^|\/)index\.html$/.test(p));
 
   const stack = [];
   if (framework === 'next') stack.push('Next.js');
@@ -103,7 +116,7 @@ function buildContext(files, tracked) {
   if (usesFirebase) stack.push('Firebase');
   if (deps.has('stripe') || deps.has('@stripe/stripe-js')) stack.push('Stripe');
   if (deps.has('@prisma/client') || deps.has('prisma')) stack.push('Prisma');
-  return { tracked, deps, usesSupabase, usesFirebase, framework, stack };
+  return { tracked, deps, usesSupabase, usesFirebase, framework, kind, app, paths, stack };
 }
 
 const IGNORE_COMMENT = /shipwarden-ignore(?:[\s:]+([\w-]+(?:\s*,\s*[\w-]+)*))?/;
@@ -120,12 +133,20 @@ function isSuppressed(finding, fileContents) {
   return false;
 }
 
-export async function scan(root, { ignore = [] } = {}) {
+/**
+ * @param {string} root
+ * @param {{ignore?: string[], checklist?: boolean, skipChecks?: string[]}} [opts]
+ *   checklist: also run the whole-codebase launch checklist (skip it for PR-scoped scans).
+ */
+export async function scan(root, { ignore = [], checklist = true, skipChecks = [] } = {}) {
   const started = Date.now();
   const { paths, tracked } = listFiles(root);
-  const ignores = [...DEFAULT_IGNORES, ...readIgnoreFile(root), ...ignore].map(globToRegExp);
+  const ignoreLines = readIgnoreFile(root);
+  const skip = new Set([...skipChecks, ...ignoreLines.filter((l) => l.startsWith('check:')).map((l) => l.slice(6).trim())]);
+  const ignores = [...DEFAULT_IGNORES, ...ignoreLines.filter((l) => !l.startsWith('check:')), ...ignore].map(globToRegExp);
   const files = loadFiles(root, paths, ignores);
-  const ctx = buildContext(files, tracked);
+  const visiblePaths = paths.filter((p) => !ignores.some((re) => re.test(p)) && !TEST_FILE.test(p));
+  const ctx = buildContext(files, tracked, visiblePaths);
   const fileContents = new Map(files.map((f) => [f.path, f.content]));
 
   const raw = [];
@@ -149,6 +170,7 @@ export async function scan(root, { ignore = [] } = {}) {
     filesScanned: files.length,
     stack: ctx.stack,
     findings,
+    checklist: checklist ? runChecklist(files.filter((f) => !TEST_FILE.test(f.path)), ctx, skip) : [],
     fileContents,
     durationMs: Date.now() - started,
   };

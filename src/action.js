@@ -35,9 +35,16 @@ async function main() {
   const pr = readEvent().pull_request;
   const sha = pr?.head?.sha ?? process.env.GITHUB_SHA;
 
-  const result = await scan(root, { ignore });
+  // The launch checklist is about the whole codebase, so it only runs on full scans
+  // (pushes, schedules, or scope: all), never on a PR that reports on changed files.
+  const prScoped = !!pr && scope === 'changed';
+  const result = await scan(root, {
+    ignore,
+    checklist: !prScoped && input('CHECKLIST', 'true') !== 'false',
+    skipChecks: input('SKIP_CHECKS').split(/[\n,]/).map((s) => s.trim()).filter(Boolean),
+  });
   let scopeNote = 'the whole repository';
-  if (pr && scope === 'changed') {
+  if (prScoped) {
     try {
       const changed = await listPullFiles({ token, owner, repo, number: pr.number });
       result.findings = result.findings.filter((f) => changed.has(f.file));

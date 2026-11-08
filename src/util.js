@@ -1,5 +1,8 @@
 export const SEVERITIES = ['critical', 'high', 'medium', 'low'];
 
+// Tests and fixtures are full of fake keys and deliberately unsafe code.
+export const TEST_FILE = /(^|\/)(__tests__|__mocks__|__fixtures__|tests?|fixtures?|e2e|cypress|spec)\/|\.(test|spec|stories)\.[cm]?[jt]sx?$/;
+
 export function severityRank(severity) {
   const i = SEVERITIES.indexOf(severity);
   return i === -1 ? SEVERITIES.length : i;

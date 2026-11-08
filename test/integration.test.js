@@ -176,4 +176,5 @@ test('GitHub Action on a pull request: scopes to changed files, annotates, comme
   assert.match(post.body.body, /https:\/\/github\.com\/acme\/app\/blob\/abc123\/supabase\/migrations\/1_init\.sql#L1/);
   assert.match(fs.readFileSync(files.summary, 'utf8'), /ShipWarden found 2 security issues/);
   assert.equal(fs.readFileSync(files.output, 'utf8'), 'findings=2\ncritical=1\nhigh=0\n');
+  assert.doesNotMatch(post.body.body, /Launch checklist/, 'PR-scoped scans leave out the whole-codebase checklist');
 });

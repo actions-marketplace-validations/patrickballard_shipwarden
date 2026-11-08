@@ -47,6 +47,35 @@ Try it on the bundled demo: `npx shipwarden examples/vulnerable-demo`
 | Raw SQL built from string interpolation | SQL injection. |
 | `dangerouslySetInnerHTML` without sanitizing | XSS. |
 
+## Launch checklist
+
+On a full scan, ShipWarden also checks for the launch basics AI tools usually skip. Each check only runs when it applies: password reset only matters if users log in with a password, and terms of service only matter if you take payments. These never fail a build.
+
+| Item | Checked when | Priority |
+|---|---|---|
+| 404 page | always | must have for single-page apps |
+| Error page / error boundary | Next.js and React apps | must have for single-page apps |
+| Privacy policy | the app has accounts, payments or analytics | must have |
+| Terms of service | the app takes payments | must have |
+| Password reset | users sign in with a password | must have |
+| Rate limits on paid AI calls | server code calls OpenAI, Anthropic, Gemini, the Lovable AI gateway and similar | must have |
+| Your own title, description and favicon | always (catches Lovable, v0, Vite and Create Next App defaults) | must have |
+| Account deletion | the app has accounts | nice to have |
+| Social preview image | always | nice to have |
+| robots.txt and sitemap | always | nice to have |
+| Error monitoring | the app has accounts or payments | nice to have |
+
+```
+Launch checklist · 3 of 10 done · 4 must-haves missing
+
+  MUST HAVE  No rate limit on paid AI calls  supabase/functions/chat/index.ts:2
+  Your server calls a paid AI API with nothing limiting how often. One script hitting that
+  endpoint in a loop can run up a bill of thousands overnight.
+  Fix: Limit requests per user or IP (e.g. @upstash/ratelimit, or a daily quota per user ...
+```
+
+Turn an item off with `--skip-check <id>` or a `check:<id>` line in `.shipwardenignore`, or the whole checklist with `--no-checklist`. Libraries and CLIs (anything that isn't a web app) get no checklist.
+
 ## Add it to GitHub (runs on every pull request)
 
 Create `.github/workflows/shipwarden.yml`:
@@ -70,7 +99,7 @@ jobs:
       - uses: patrickballard/shipwarden@v0
 ```
 
-On a pull request, ShipWarden only reports problems in files the PR changes. It flags them inline on the diff and keeps one summary comment up to date instead of posting a new one on every push. It fails the check on critical findings.
+On a pull request, ShipWarden only reports security problems in files the PR changes, and leaves out the launch checklist, which is about the whole codebase. Pushes to `main` run a full scan with the checklist in the job summary. It flags them inline on the diff and keeps one summary comment up to date instead of posting a new one on every push. It fails the check on critical findings.
 
 | Input | Default | |
 |---|---|---|
@@ -78,6 +107,8 @@ On a pull request, ShipWarden only reports problems in files the PR changes. It 
 | `scope` | `changed` | `all` reports on the whole repo on pull requests too. |
 | `comment` | `true` | Post the summary comment on pull requests. |
 | `ignore` | | Extra globs to skip, comma or newline separated. |
+| `checklist` | `true` | Run the launch checklist on full scans (pushes, schedules, `scope: all`). |
+| `skip-checks` | | Checklist item ids to turn off, e.g. `robots-sitemap, error-monitoring`. |
 | `anthropic-api-key` | | Turns on the optional AI review (below). |
 | `ai-model` | `claude-opus-5-5` | Claude model for the AI review. |
 
@@ -102,10 +133,11 @@ In the Action, set `anthropic-api-key: ${{ secrets.ANTHROPIC_API_KEY }}`. A revi
 ## CLI
 
 ```
-shipwarden [path] [--format text|json|markdown] [--fail-on <severity|none>] [--ignore <glob>] [--ai] [--model <id>]
+shipwarden [path] [--format text|json|markdown] [--fail-on <severity|none>] [--ignore <glob>]
+           [--no-checklist] [--skip-check <id>] [--ai] [--model <id>]
 ```
 
-Exit code 1 means a finding is at or above `--fail-on` (default `critical`).
+Exit code 1 means a security finding is at or above `--fail-on` (default `critical`). The checklist never changes the exit code.
 
 ## Limitations
 

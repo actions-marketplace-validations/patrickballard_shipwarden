@@ -18,6 +18,8 @@ Options:
   --format <text|json|markdown>  Output format (default: text)
   --fail-on <severity|none>      Exit 1 if any finding is at least this severe (default: critical)
   --ignore <glob>                Skip matching files (repeatable; also reads .shipwardenignore)
+  --no-checklist                 Skip the launch checklist (404 page, privacy policy, ...)
+  --skip-check <id>              Turn off one checklist item (repeatable; or add check:<id> to .shipwardenignore)
   --ai                           Ask Claude to double-check uncertain findings (needs ANTHROPIC_API_KEY)
   --model <id>                   Claude model for --ai (default: ${DEFAULT_MODEL})
   --no-color                     Disable colors
@@ -28,7 +30,7 @@ Severities: ${SEVERITIES.join(', ')}
 `;
 
 function parseArgs(argv) {
-  const opts = { target: '.', format: 'text', failOn: 'critical', ignore: [], ai: false, model: DEFAULT_MODEL, color: process.stdout.isTTY && !process.env.NO_COLOR };
+  const opts = { target: '.', format: 'text', failOn: 'critical', ignore: [], skipChecks: [], checklist: true, ai: false, model: DEFAULT_MODEL, color: process.stdout.isTTY && !process.env.NO_COLOR };
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
     const value = () => {
@@ -43,6 +45,8 @@ function parseArgs(argv) {
     else if (arg === '--fail-on') opts.failOn = value();
     else if (arg === '--ignore') opts.ignore.push(value());
     else if (arg === '--ai') opts.ai = true;
+    else if (arg === '--no-checklist') opts.checklist = false;
+    else if (arg === '--skip-check') opts.skipChecks.push(value());
     else if (arg === '--model') opts.model = value();
     else if (arg === '--no-color') opts.color = false;
     else if (arg.startsWith('-')) throw new Error(`Unknown option ${arg}`);
@@ -60,7 +64,7 @@ async function main() {
 
   const root = path.resolve(opts.target);
   if (!fs.existsSync(root) || !fs.statSync(root).isDirectory()) throw new Error(`Not a directory: ${opts.target}`);
-  const result = await scan(root, { ignore: opts.ignore });
+  const result = await scan(root, { ignore: opts.ignore, checklist: opts.checklist, skipChecks: opts.skipChecks });
 
   let aiNote = '';
   let ai;

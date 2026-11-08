@@ -20,6 +20,12 @@ inputs:
   ignore:
     description: Extra glob patterns to skip, comma or newline separated (also reads .shipwardenignore)
     default: ''
+  checklist:
+    description: On full scans (not PR-scoped ones), also run the launch checklist (404 page, privacy policy, rate limits on AI calls, ...)
+    default: 'true'
+  skip-checks:
+    description: Checklist item ids to turn off, comma or newline separated
+    default: ''
   anthropic-api-key:
     description: Optional. Lets Claude double-check uncertain findings and drop false positives
     default: ''
@@ -55,5 +61,7 @@ runs:
         INPUT_SCOPE: ${{ inputs.scope }}
         INPUT_COMMENT: ${{ inputs.comment }}
         INPUT_IGNORE: ${{ inputs.ignore }}
+        INPUT_CHECKLIST: ${{ inputs.checklist }}
+        INPUT_SKIP_CHECKS: ${{ inputs.skip-checks }}
         INPUT_ANTHROPIC_API_KEY: ${{ inputs.anthropic-api-key }}
         INPUT_AI_MODEL: ${{ inputs.ai-model }}
