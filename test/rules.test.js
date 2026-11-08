@@ -317,6 +317,64 @@ create table public.events_2027_02 partition of public.events for values from ('
   assert.deepEqual(titles, ['supabase/migrations/1.sql:3 Row Level Security is off for 2 partitions of `events`']);
 });
 
+test('Supabase Storage: policies that skip the owner check', async () => {
+  const root = makeRepo({
+    'package.json': supabasePkg,
+    'supabase/migrations/1_storage.sql': `insert into storage.buckets (id, name, public) values ('avatars', 'avatars', true), ('documents', 'documents', false);
+create policy "Avatars are public" on storage.objects for select using (bucket_id = 'avatars');
+create policy "Anyone can upload an avatar" on storage.objects for insert with check (bucket_id = 'avatars');
+create policy "Users can delete files" on storage.objects for delete to authenticated using (bucket_id = 'documents');
+create policy "Anyone can update avatars" on storage.objects for update using (bucket_id = 'avatars');
+create policy "Read documents" on storage.objects for select using (bucket_id = 'documents' and auth.role() = 'authenticated');
+create policy "Own documents" on storage.objects for update to authenticated using (bucket_id = 'documents' and (storage.foldername(name))[1] = auth.uid()::text);
+create policy "Admins" on storage.objects for delete using (bucket_id = 'documents' and public.is_admin());
+create policy "Service" on storage.objects for all to service_role using (true);
+create policy "Signed-in uploads" on storage.objects for insert to authenticated with check (bucket_id = 'documents');
+`,
+  });
+  assert.deepEqual(
+    (await scan(root)).findings.map((f) => `${f.line} ${f.severity} ${f.title}`),
+    [
+      '5 high Storage policy lets anyone overwrite any file in the `avatars` bucket',
+      '4 medium Storage policy lets any logged-in user delete any file in the `documents` bucket',
+      '6 medium Storage policy lets any logged-in user read every file in the private `documents` bucket',
+      '3 low Storage policy lets anyone upload files to the `avatars` bucket',
+    ],
+  );
+});
+
+test('Supabase: SECURITY DEFINER functions need a fixed search_path', async () => {
+  const root = makeRepo({
+    'package.json': supabasePkg,
+    'supabase/migrations/1_fns.sql': `create or replace function public.has_role(_user_id uuid, _role text)
+returns boolean language sql stable security definer set search_path = public as $$
+  select exists (select 1 from public.user_roles where user_id = _user_id and role = _role); -- security definer
+$$;
+create function public.handle_new_user() returns trigger language plpgsql security definer as $$
+begin
+  insert into public.profiles (id) values (new.id);
+  return new;
+end;
+$$;
+create function public.fixed_later() returns void language sql security definer as 'select 1';
+create function public.plain() returns void language sql as $$ select 1 $$;
+create function public.dropped() returns void language sql security definer as $$ select 1 $$;
+`,
+    'supabase/migrations/2_fix.sql': `alter function public.fixed_later() set search_path = '';
+drop function public.dropped();
+create function a() returns void language sql security definer as $$ select 1 $$;
+create function b() returns void language sql security definer as $$ select 1 $$;
+`,
+  });
+  assert.deepEqual(
+    (await scan(root)).findings.map((f) => `${f.file.split('/').pop()}:${f.line} ${f.severity} ${f.title}`),
+    [
+      "1_fns.sql:5 low Function `handle_new_user` runs with its owner's privileges but has no fixed search_path",
+      "2_fix.sql:3 low 2 functions run with their owner's privileges but have no fixed search_path",
+    ],
+  );
+});
+
 test('.env and public env rules ignore local-only values and commented-out lines', async () => {
   const root = makeRepo(
     {

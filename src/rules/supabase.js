@@ -10,6 +10,10 @@ const STATEMENTS = {
   createView: new RegExp(String.raw`\bcreate\s+(?:or\s+replace\s+)?(?<mat>materialized\s+)?view\s+(?:if\s+not\s+exists\s+)?${QNAME}(?<rest>[^;]*)`, 'gi'),
   alterView: new RegExp(String.raw`\balter\s+view\s+(?:if\s+exists\s+)?${QNAME}\s+set\s*\((?<opts>[^)]*)\)`, 'gi'),
   dropView: new RegExp(String.raw`\bdrop\s+(?:materialized\s+)?view\s+(?:if\s+exists\s+)?${QNAME}`, 'gi'),
+  // Bodies are blanked here, so `[^;]*` runs to the end of the statement and sees every attribute.
+  createFunction: new RegExp(String.raw`\bcreate\s+(?:or\s+replace\s+)?(?:function|procedure)\s+${QNAME}\s*\((?<rest>[^;]*)`, 'gi'),
+  alterFunction: new RegExp(String.raw`\balter\s+(?:function|procedure)\s+${QNAME}(?<rest>[^;]*)`, 'gi'),
+  dropFunction: new RegExp(String.raw`\bdrop\s+(?:function|procedure)\s+(?:if\s+exists\s+)?${QNAME}`, 'gi'),
 };
 
 // Matched with DO-block bodies kept: Lovable/AI migrations often wrap these in `DO $$ BEGIN ... END $$`.
@@ -92,6 +96,69 @@ function invokerOn(opts) {
   return !!m && (!m[1] || /^(true|on|1|yes)$/i.test(m[1]));
 }
 
+/** The text inside `using (...)` or `with check (...)`, with nested parentheses. */
+function clause(body, keyword) {
+  const m = new RegExp(String.raw`\b${keyword}\s*\(`, 'i').exec(body);
+  if (!m) return null;
+  let depth = 1;
+  let i = m.index + m[0].length;
+  for (; i < body.length && depth; i++) depth += body[i] === '(' ? 1 : body[i] === ')' ? -1 : 0;
+  return body.slice(m.index + m[0].length, i - 1);
+}
+
+function policyInfo(body) {
+  const rolesRaw = /\bto\s+((?:"[^"]+"|[\w$]+)(?:\s*,\s*(?:"[^"]+"|[\w$]+))*)/i.exec(body)?.[1];
+  return {
+    cmd: (/\bfor\s+(all|select|insert|update|delete)\b/i.exec(body)?.[1] ?? 'all').toLowerCase(),
+    roles: rolesRaw ? rolesRaw.split(',').map((r) => r.trim().replace(/"/g, '').toLowerCase()) : ['public'],
+    using: clause(body, 'using'),
+    check: clause(body, String.raw`with\s+check`),
+  };
+}
+
+const ADMIN_ROLES = ['service_role', 'postgres', 'supabase_admin'];
+
+/** `id -> public` for buckets created in SQL. Buckets made in the dashboard are unknown. */
+function buckets(sqlFiles) {
+  const out = new Map();
+  const re = /\binsert\s+into\s+storage\s*\.\s*buckets\s*\(([^)]*)\)\s*values\s*((?:\([^)]*\)\s*,?\s*)+)/gi;
+  for (const file of sqlFiles) {
+    for (const m of cleanSql(file.content, { keepBodies: true }).matchAll(re)) {
+      const cols = m[1].split(',').map((c) => c.trim().replace(/"/g, '').toLowerCase());
+      const id = cols.indexOf('id') === -1 ? cols.indexOf('name') : cols.indexOf('id');
+      const pub = cols.indexOf('public');
+      for (const row of m[2].matchAll(/\(([^)]*)\)/g)) {
+        const values = row[1].match(/'(?:[^']|'')*'|[^,]+/g)?.map((v) => v.trim().replace(/^'|'$/g, '')) ?? [];
+        if (values[id]) out.set(values[id], pub !== -1 && /^true$/i.test(values[pub] ?? ''));
+      }
+    }
+  }
+  return out;
+}
+
+// "Logged in" conditions that don't tie a file to its owner.
+const LOGGED_IN = /\(?\s*(?:select\s+)?auth\s*\.\s*uid\s*\(\s*\)\s*\)?\s*is\s+not\s+null|auth\s*\.\s*role\s*\(\s*\)\s*=\s*'authenticated'/gi;
+const PATH_FUNCTIONS = new Set(['storage.foldername', 'storage.filename', 'storage.extension', 'lower', 'upper', 'coalesce', 'in', 'and', 'or', 'not', 'array']);
+
+/**
+ * Whether a storage policy condition limits access to some user. Any call we don't recognise
+ * (a custom `is_admin()`, a subquery) counts as a check, so we stay quiet when unsure.
+ */
+function checksUser(expr) {
+  const rest = expr.replace(LOGGED_IN, ' ');
+  if (/\bauth\s*\.\s*(?:uid|jwt)\s*\(|\bowner(?:_id)?\b|\bexists\s*\(|\bselect\b/i.test(rest)) return true;
+  return [...rest.matchAll(/([A-Za-z_][\w$]*(?:\s*\.\s*[A-Za-z_][\w$]*)?)\s*\(/g)].some((m) => !PATH_FUNCTIONS.has(m[1].replace(/\s+/g, '').toLowerCase()));
+}
+
+function bucketsIn(expr) {
+  const out = [];
+  for (const m of expr.matchAll(/\bbucket_id\s*(?:=\s*'([^']+)'|in\s*\(([^)]*)\))/gi)) {
+    if (m[1]) out.push(m[1]);
+    else out.push(...[...m[2].matchAll(/'([^']+)'/g)].map((b) => b[1]));
+  }
+  return out;
+}
+
 const cache = new WeakMap();
 
 /**
@@ -135,6 +202,7 @@ function analyze(files) {
   const tables = new Map();
   const views = new Map();
   const policies = new Map();
+  const functions = new Map();
   for (const { kind, m, file, d } of events) {
     if (kind === 'dynamicRls') {
       for (const t of tables.values()) if (t.schema === 'public' && (d.all || d.names.includes(t.name.toLowerCase()))) t.rls = true;
@@ -167,12 +235,23 @@ function analyze(files) {
       policies.set(`${key}:${m.groups.policy}`, { schema, name, body: m.groups.body, ...loc });
     } else if (kind === 'dropPolicy') {
       policies.delete(`${key}:${m.groups.policy}`);
+    } else if (kind === 'createFunction') {
+      const { rest } = m.groups;
+      functions.set(key, { schema, name, definer: /\bsecurity\s+definer\b/i.test(rest), pinned: /\bset\s+search_path\b/i.test(rest), ...loc });
+    } else if (kind === 'alterFunction') {
+      const fn = functions.get(key);
+      if (!fn) continue;
+      if (/\bset\s+search_path\b/i.test(m.groups.rest)) fn.pinned = true;
+      if (/\bsecurity\s+invoker\b/i.test(m.groups.rest)) fn.definer = false;
+      if (/\bsecurity\s+definer\b/i.test(m.groups.rest)) fn.definer = true;
+    } else if (kind === 'dropFunction') {
+      functions.delete(key);
     }
   }
   for (const [key, t] of tables) {
     if (!t.rls && !t.disabledExplicitly && enabledAnywhere.has(key)) t.rls = true;
   }
-  const result = { tables, views, policies: [...policies.values()] };
+  const result = { tables, views, functions, policies: [...policies.values()], buckets: buckets(sql) };
   cache.set(files, result);
   return result;
 }
@@ -230,10 +309,8 @@ export const permissivePolicy = {
     const findings = [];
     for (const p of analyze(files).policies) {
       if (p.schema !== 'public' || /\bas\s+restrictive\b/i.test(p.body)) continue;
-      const cmd = (/\bfor\s+(all|select|insert|update|delete)\b/i.exec(p.body)?.[1] ?? 'all').toLowerCase();
-      const rolesRaw = /\bto\s+((?:"[^"]+"|[\w$]+)(?:\s*,\s*(?:"[^"]+"|[\w$]+))*)/i.exec(p.body)?.[1];
-      const roles = rolesRaw ? rolesRaw.split(',').map((r) => r.trim().replace(/"/g, '').toLowerCase()) : ['public'];
-      if (roles.every((r) => ['service_role', 'postgres', 'supabase_admin'].includes(r))) continue;
+      const { cmd, roles } = policyInfo(p.body);
+      if (roles.every((r) => ADMIN_ROLES.includes(r))) continue;
       const usingTrue = /\busing\s*\(\s*true\s*\)/i.test(p.body);
       const checkTrue = /\bwith\s+check\s*\(\s*true\s*\)/i.test(p.body);
       const anyone = roles.some((r) => r === 'public' || r === 'anon');
@@ -290,4 +367,100 @@ export const unsafeView = {
   },
 };
 
-export default [rlsDisabled, permissivePolicy, unsafeView];
+export const storagePolicy = {
+  id: 'supabase-storage-policy',
+  title: 'Storage policy lets anyone change files',
+  severity: 'high',
+  checkAll(files, ctx) {
+    if (!ctx.usesSupabase) return [];
+    const { policies, buckets: known } = analyze(files);
+    const findings = [];
+    for (const p of policies) {
+      if (p.schema !== 'storage' || p.name !== 'objects' || /\bas\s+restrictive\b/i.test(p.body)) continue;
+      const { cmd, roles, using, check } = policyInfo(p.body);
+      if (roles.every((r) => ADMIN_ROLES.includes(r))) continue;
+      const expr = (cmd === 'insert' ? check : using ?? check) ?? 'true';
+      if (checksUser(expr)) continue;
+
+      const anyone = roles.some((r) => r === 'public' || r === 'anon') && expr.replace(LOGGED_IN, '') === expr;
+      const who = anyone ? 'anyone' : 'any logged-in user';
+      const ids = bucketsIn(expr);
+      const where = ids.length === 0 ? 'every bucket' : ids.length === 1 ? `the \`${ids[0]}\` bucket` : `the ${ids.map((b) => `\`${b}\``).join(', ')} buckets`;
+      const bucket = ids[0] ?? 'your-bucket';
+      const ownerFix =
+        `Store each user's files under a folder named after their id and check it, e.g. ` +
+        `\`using (bucket_id = '${bucket}' and (storage.foldername(name))[1] = auth.uid()::text)\`.`;
+
+      if (['all', 'update', 'delete'].includes(cmd)) {
+        const verb = { all: 'read, overwrite and delete', update: 'overwrite', delete: 'delete' }[cmd];
+        findings.push(
+          makeFinding(this, p.file, p.line, {
+            severity: anyone ? 'high' : 'medium',
+            title: `Storage policy lets ${who} ${verb} any file in ${where}`,
+            message: `This policy on \`storage.objects\` never checks who uploaded a file, so ${anyone ? 'anyone with your public anon key' : 'any logged-in user'} can ${verb} every file in ${where}, including other users' files.`,
+            fix: ownerFix,
+          }),
+        );
+      } else if (cmd === 'insert' && anyone) {
+        findings.push(
+          makeFinding(this, p.file, p.line, {
+            severity: 'low',
+            title: `Storage policy lets anyone upload files to ${where}`,
+            message: `Logged-out visitors can upload any file to ${where} using your public anon key: people can fill your storage (and your bill) or use it to host their own files.`,
+            fix: `Add \`to authenticated\` to the policy, and ideally limit uploads to the user's own folder: \`with check (bucket_id = '${bucket}' and (storage.foldername(name))[1] = auth.uid()::text)\`.`,
+          }),
+        );
+      } else if (cmd === 'select') {
+        // Reading a public bucket is expected; only private buckets created in SQL are known to be private.
+        const exposed = (ids.length ? ids : [...known.keys()]).filter((b) => known.get(b) === false);
+        if (!exposed.length) continue;
+        const label = exposed.length === 1 ? `the private \`${exposed[0]}\` bucket` : `the private ${exposed.map((b) => `\`${b}\``).join(', ')} buckets`;
+        findings.push(
+          makeFinding(this, p.file, p.line, {
+            severity: anyone ? 'high' : 'medium',
+            title: `Storage policy lets ${who} read every file in ${label}`,
+            message: `The bucket is private, but this policy lets ${anyone ? 'anyone with your public anon key' : 'any logged-in user'} list and download every file in it, including other users' files.`,
+            fix: ownerFix,
+          }),
+        );
+      }
+    }
+    return findings;
+  },
+};
+
+export const definerSearchPath = {
+  id: 'supabase-definer-search-path',
+  title: 'SECURITY DEFINER function without a fixed search_path',
+  severity: 'low',
+  checkAll(files, ctx) {
+    if (!ctx.usesSupabase) return [];
+    // One finding per migration file: AI-written migrations often define a dozen of these at once.
+    const byFile = new Map();
+    for (const fn of analyze(files).functions.values()) {
+      if (!fn.definer || fn.pinned) continue;
+      if (!byFile.has(fn.file)) byFile.set(fn.file, []);
+      byFile.get(fn.file).push(fn);
+    }
+    return [...byFile.values()].map((fns) => {
+      const [first] = fns;
+      const names = fns.map((f) => `\`${f.name}\``);
+      const list = names.length > 4 ? `${names.slice(0, 4).join(', ')} and ${names.length - 4} more` : names.join(', ');
+      return makeFinding(this, first.file, first.line, {
+        title:
+          fns.length === 1
+            ? `Function \`${first.name}\` runs with its owner's privileges but has no fixed search_path`
+            : `${fns.length} functions run with their owner's privileges but have no fixed search_path`,
+        message:
+          `${fns.length === 1 ? 'This function is' : `${list} are`} \`security definer\`, so ${fns.length === 1 ? 'it runs' : 'they run'} as the owner and skip Row Level Security. ` +
+          "Without `set search_path`, tables and functions are looked up using the caller's search_path, so anyone who can create objects in a schema on that path " +
+          "can make them run their code with the owner's privileges. Supabase's Security Advisor flags this too.",
+        fix:
+          `Add \`set search_path = ''\` to each function and write table names in full inside it (e.g. \`public.profiles\`), ` +
+          `or run \`alter function ${first.schema}.${first.name} set search_path = '';\` for each one. \`set search_path = public\` also works if you'd rather not rename things.`,
+      });
+    });
+  },
+};
+
+export default [rlsDisabled, permissivePolicy, unsafeView, storagePolicy, definerSearchPath];

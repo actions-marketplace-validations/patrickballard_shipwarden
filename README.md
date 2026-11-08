@@ -35,6 +35,8 @@ Try it on the bundled demo: `npx shipwarden examples/vulnerable-demo`
 | Supabase table without Row Level Security | Your anon key is public, so every row is readable and writable by anyone. Migrations are replayed in order, including `DO` blocks and RLS loops. |
 | RLS policy with `using (true)` | The classic AI-written "System can manage X" policy: anyone can edit or delete everything. |
 | View or materialized view that bypasses RLS | Views run as their owner unless `security_invoker` is on. |
+| Supabase Storage policy with no owner check | Lets anyone (or any logged-in user) overwrite or delete other people's files, upload to your buckets, or read private buckets. |
+| `security definer` function without a fixed `search_path` | It runs as its owner and skips RLS, so it should never look objects up through the caller's search_path. |
 | `service_role` key in the code | Decoded from the JWT itself, so the public `anon` key never triggers it. |
 | Secrets behind `NEXT_PUBLIC_` / `VITE_` / `EXPO_PUBLIC_` | These are baked into your frontend bundle. |
 | AI SDK with `dangerouslyAllowBrowser` | Your OpenAI/Anthropic key ships to every visitor. |
