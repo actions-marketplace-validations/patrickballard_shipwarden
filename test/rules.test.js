@@ -316,3 +316,15 @@ create table public.events_2027_02 partition of public.events for values from ('
   const titles = (await scan(root)).findings.map((f) => `${f.file}:${f.line} ${f.title}`);
   assert.deepEqual(titles, ['supabase/migrations/1.sql:3 Row Level Security is off for 2 partitions of `events`']);
 });
+
+test('.env and public env rules ignore local-only values and commented-out lines', async () => {
+  const root = makeRepo(
+    {
+      '.env': 'DATABASE_URL=postgresql://postgres:password@localhost:5432/app\nNODE_ENV=development\nPORT=3000\n',
+      'api/.env': 'DATABASE_URL=postgresql://app:Xk29fLq@db.acme-prod.net:5432/app\n',
+      '.env.example': '# VITE_SUPABASE_SERVICE_ROLE_KEY=your-key\n',
+    },
+    { git: true },
+  );
+  assert.deepEqual(hits(await scan(root)), ['env-file-committed api/.env']);
+});

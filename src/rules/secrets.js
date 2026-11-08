@@ -87,6 +87,8 @@ export const publicEnvSecret = {
     for (const m of file.content.matchAll(PUBLIC_VAR)) {
       const [name, prefix, rest] = m;
       if (seen.has(name) || /PUBLISHABLE|ANON/.test(rest)) continue;
+      const lineStart = file.content.lastIndexOf('\n', m.index) + 1;
+      if (/^\s*(#|\/\/|\*)/.test(file.content.slice(lineStart, m.index))) continue; // commented out
       const critical = CRITICAL_NAME.test(rest);
       if (!critical && !AI_KEY_NAME.test(rest)) continue;
       // The ai-key-in-browser finding already covers an AI key used from browser code.

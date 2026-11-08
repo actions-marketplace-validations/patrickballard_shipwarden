@@ -1,4 +1,4 @@
-import { EDGE_FUNCTION, ROUTE_HANDLER, hasDirective, isServerEndpoint, lineAt, makeFinding } from '../util.js';
+import { EDGE_FUNCTION, ROUTE_HANDLER, hasDirective, isServerEndpoint, lineAt, looksLikePlaceholder, makeFinding } from '../util.js';
 
 const MUTATING_EXPORT = /export\s+(?:async\s+)?function\s+(POST|PUT|PATCH|DELETE)\b|export\s+const\s+(POST|PUT|PATCH|DELETE)\s*=|\bas\s+(POST|PUT|PATCH|DELETE)\b/;
 
@@ -177,8 +177,11 @@ export const committedEnvFile = {
   severity: 'high',
   check(file, ctx) {
     if (!ctx.tracked || !ENV_FILE.test(file.path) || ENV_TEMPLATE.test(file.path)) return [];
-    const names = [...file.content.matchAll(/^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*['"]?[^\s'"#]/gm)].map((m) => m[1]);
-    const secrets = names.filter((n) => !PUBLIC_PREFIX.test(n));
+    const vars = [...file.content.matchAll(/^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*['"]?([^\s'"#][^\n'"]*)/gm)];
+    // Public values and local-only dev settings (localhost databases, "password") aren't leaks.
+    const secrets = vars
+      .filter(([, name, value]) => !PUBLIC_PREFIX.test(name) && !/localhost|127\.0\.0\.1|0\.0\.0\.0|host\.docker\.internal/.test(value) && !looksLikePlaceholder(value) && !/^(password|secret|changeme|true|false|\d+|development|production|test)$/i.test(value))
+      .map(([, name]) => name);
     if (!secrets.length) return [];
     const shown = secrets.slice(0, 5).map((n) => `\`${n}\``).join(', ');
     return [
