@@ -1,0 +1,318 @@
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import { scan } from '../src/scanner.js';
+import { globToRegExp } from '../src/util.js';
+import { browserFlag, hits, makeRepo, stripeLiveKey, supabaseJwt, supabasePkg, vitePkg } from './helpers.js';
+
+test('Supabase: replays migrations to find tables without RLS, open policies and unsafe views', async () => {
+  const root = makeRepo({
+    'package.json': supabasePkg,
+    'supabase/migrations/20240101000000_init.sql': `-- schema
+create table public.profiles (id uuid primary key, email text);
+create table if not exists "public"."posts" (id bigint, user_id uuid);
+alter table public.posts enable row level security;
+create table todos (id int);
+create temporary table scratch (id int);
+create table private.secrets (id int);
+create or replace function public.handle() returns trigger as $$
+begin
+  create table should_not_count (id int);
+  return new;
+end;
+$$ language plpgsql;
+-- create table commented_out (id int);
+/* create table also_commented (id int); */
+create policy "delete anything" on public.posts for delete to authenticated using (true);
+create policy "owners update" on public.posts for update using (auth.uid() = user_id);
+create policy "public read" on public.posts for select using (true);
+create policy "contact form" on public.messages for insert to anon with check (true);
+create policy "admin" on public.posts for all to service_role using (true);
+create view public.post_stats as select count(*) from posts;
+create view public.safe_view with (security_invoker = true) as select 1;
+create view public.fixed_later as select 1;
+`,
+    'supabase/migrations/20240202000000_more.sql': `alter table todos enable row level security;
+alter table public.legacy disable row level security;
+alter view public.fixed_later set (security_invoker = on);
+`,
+  });
+  const result = await scan(root);
+  const byRule = (id) => result.findings.filter((f) => f.ruleId === id);
+
+  assert.deepEqual(
+    byRule('supabase-rls-disabled').map((f) => [f.file.split('/').pop(), f.line]),
+    [
+      ['20240101000000_init.sql', 2],
+      ['20240202000000_more.sql', 2],
+    ],
+  );
+  assert.match(byRule('supabase-rls-disabled')[0].title, /profiles/);
+  assert.match(byRule('supabase-rls-disabled')[1].message, /turns Row Level Security off/);
+
+  const policies = byRule('supabase-permissive-policy');
+  assert.equal(policies.length, 2);
+  assert.equal(policies[0].severity, 'high');
+  assert.match(policies[0].title, /any logged-in user delete any row in `posts`/);
+  assert.equal(policies.find((f) => f.severity === 'low').title, 'RLS policy lets anyone insert anything into `messages`');
+
+  assert.deepEqual(byRule('supabase-view-bypasses-rls').map((f) => f.title), ['View `post_stats` bypasses Row Level Security']);
+});
+
+test('Supabase rules stay quiet when the project does not use Supabase', async () => {
+  const root = makeRepo({
+    'package.json': JSON.stringify({ dependencies: { '@prisma/client': '6.0.0' } }),
+    'prisma/migrations/1_init/migration.sql': 'CREATE TABLE "User" (id serial primary key);',
+  });
+  assert.deepEqual(hits(await scan(root)), []);
+});
+
+test('Firebase: open rules, test mode, signed-in catch-all and Realtime Database', async () => {
+  const root = makeRepo({
+    'firestore.rules': `rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    match /{document=**} {
+      allow read, write: if request.time < timestamp.date(2025, 3, 1);
+    }
+  }
+}`,
+    'storage.rules': `rules_version = '2';
+service firebase.storage {
+  match /b/{bucket}/o {
+    match /{allPaths=**} {
+      allow read, write: if request.auth != null;
+    }
+  }
+}`,
+    'other/firestore.rules': `service cloud.firestore {
+  match /databases/{database}/documents {
+    match /posts/{postId} {
+      allow read: if true;
+      allow write: if true;
+    }
+    match /users/{userId} {
+      // allow read, write: if true;
+      allow read, write: if request.auth != null && request.auth.uid == userId;
+    }
+  }
+}`,
+    'database.rules.json': '{ "rules": { ".read": true, ".write": "auth != null" } }',
+  });
+  const found = (await scan(root)).findings.map((f) => [f.file, f.line, f.severity, f.title]);
+  assert.deepEqual(
+    found.map(([file, line, severity]) => `${severity} ${file}:${line}`).sort(),
+    ['critical firestore.rules:5', 'critical other/firestore.rules:5', 'high database.rules.json:1', 'high storage.rules:5', 'low other/firestore.rules:4'].sort(),
+  );
+  assert.ok(found.some(([, , , title]) => title === 'Any signed-in user can read and write your whole Storage bucket'));
+  assert.ok(found.some(([, , , title]) => title === 'Firebase "test mode" rules are still in place'));
+});
+
+test('Secrets: service_role JWTs, live keys and public env vars, but not anon keys or placeholders', async () => {
+  const root = makeRepo({
+    'package.json': vitePkg,
+    'src/integrations/supabase/client.ts': `export const anon = "${supabaseJwt('anon')}";\nexport const admin = "${supabaseJwt('service_role')}";\n`,
+    'server/pay.ts': `const stripe = new Stripe("${stripeLiveKey}");\nconst docs = "${['sk', 'live', 'x'.repeat(24)].join('_')}";\n`,
+    '.env.example': 'NEXT_PUBLIC_SUPABASE_SERVICE_ROLE_KEY=\nVITE_OPENAI_API_KEY=\nNEXT_PUBLIC_SUPABASE_ANON_KEY=\nNEXT_PUBLIC_STRIPE_PUBLISHABLE_KEY=\nNEXT_PUBLIC_SITE_URL=\n',
+    'src/lib/ai.ts': `import OpenAI from 'openai';\nexport const openai = new OpenAI({ apiKey: import.meta.env.VITE_OPENAI_API_KEY, ${browserFlag} });\n`,
+  });
+  const result = await scan(root);
+  assert.deepEqual(hits(result), [
+    'ai-key-in-browser src/lib/ai.ts',
+    'hardcoded-secret server/pay.ts',
+    'public-env-secret .env.example',
+    'public-env-secret .env.example',
+    'supabase-service-role-key src/integrations/supabase/client.ts',
+  ]);
+  const jwt = result.findings.find((f) => f.ruleId === 'supabase-service-role-key');
+  assert.equal(jwt.line, 2);
+  assert.match(jwt.message, /shipped to every visitor's browser/);
+  const severities = result.findings.filter((f) => f.ruleId === 'public-env-secret' && f.file === '.env.example').map((f) => f.severity);
+  assert.deepEqual(severities, ['critical', 'high']);
+});
+
+test('Endpoints: flags writes with no auth check, skips protected and RLS-guarded ones', async () => {
+  const admin = `import { createClient } from '@supabase/supabase-js';\nconst supabase = createClient(process.env.NEXT_PUBLIC_SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY);\n`;
+  const root = makeRepo({
+    'package.json': supabasePkg,
+    'app/api/admin/delete-user/route.ts': `${admin}export async function DELETE(req) {\n  const { id } = await req.json();\n  await supabase.from('profiles')\n    .delete().eq('id', id);\n  return Response.json({ ok: true });\n}\n`,
+    'app/api/profile/route.ts': `${admin}export async function POST(req) {\n  const { data: { user } } = await supabase.auth.getUser();\n  if (!user) return new Response('no', { status: 401 });\n  await supabase.from('profiles').update({ name: 'x' }).eq('id', user.id);\n}\n`,
+    'app/api/stats/route.ts': `${admin}export async function GET() {\n  await supabase.from('visits').insert({});\n}\n`,
+    'app/api/notes/route.ts': `import { createClient } from '@/utils/supabase/server';\nexport async function POST() {\n  const supabase = await createClient();\n  await supabase.from('notes').insert({ body: 'hi' });\n}\n`,
+    'app/actions.ts': `'use server';\nimport { prisma } from '@/lib/prisma';\nexport async function deleteAccount(id) {\n  await prisma.user.delete({ where: { id } });\n}\n`,
+    'supabase/functions/admin-reset/index.ts': `import { createClient } from 'jsr:@supabase/supabase-js@2';\nDeno.serve(async (req) => {\n  const supabase = createClient(Deno.env.get('SUPABASE_URL'), Deno.env.get('SUPABASE_SERVICE_ROLE_KEY'));\n  await supabase.from('credits').update({ amount: 1000 }).neq('id', 0);\n  return new Response('ok');\n});\n`,
+    'supabase/functions/cron/index.ts': `Deno.serve(async (req) => {\n  if (req.headers.get('x-secret') !== Deno.env.get('CRON_SECRET')) return new Response('no', { status: 401 });\n  const supabase = createClient(url, Deno.env.get('SUPABASE_SERVICE_ROLE_KEY'));\n  await supabase.from('jobs').delete().lt('at', 1);\n});\n`,
+    'app/api/stripe/webhook/route.ts': `import Stripe from 'stripe';\nconst stripe = new Stripe(process.env.STRIPE_SECRET_KEY);\nexport async function POST(req) {\n  const event = await req.json();\n  if (event.type === 'checkout.session.completed') {}\n}\n`,
+    'app/api/billing/webhook/route.ts': `import Stripe from 'stripe';\nexport async function POST(req) {\n  const event = stripe.webhooks.constructEvent(await req.text(), req.headers.get('stripe-signature'), secret);\n}\n`,
+    'middleware.ts': `export async function middleware(req) {\n  const { data } = await supabase.auth.getSession();\n}\n`,
+    'app/dashboard/page.tsx': `export default async function Page() {\n  const { data } = await supabase.auth.getSession();\n  const { data: u } = await supabase.auth.getUser();\n}\n`,
+  });
+  const result = await scan(root);
+  assert.deepEqual(hits(result), [
+    'stripe-webhook-unverified app/api/stripe/webhook/route.ts',
+    'supabase-getsession-on-server middleware.ts',
+    'unauthenticated-write app/actions.ts',
+    'unauthenticated-write app/api/admin/delete-user/route.ts',
+    'unauthenticated-write supabase/functions/admin-reset/index.ts',
+  ]);
+  const del = result.findings.find((f) => f.file === 'app/api/admin/delete-user/route.ts');
+  assert.equal(del.severity, 'high');
+  assert.equal(del.line, 5);
+  assert.equal(result.findings.find((f) => f.file === 'app/actions.ts').severity, 'medium');
+});
+
+test('XSS and SQL injection heuristics', async () => {
+  const root = makeRepo({
+    'components/Bio.tsx': 'export const Bio = ({ user }) => <div dangerouslySetInnerHTML={{ __html: user.bio }} />;\n',
+    'components/Static.tsx': 'export const S = () => <div dangerouslySetInnerHTML={{ __html: "<b>hi</b>" }} />;\n',
+    'components/Clean.tsx': "import DOMPurify from 'dompurify';\nexport const C = ({ html }) => <div dangerouslySetInnerHTML={{ __html: clean }} />;\n",
+    'components/Seo.tsx': 'export const J = ({ data }) => <script dangerouslySetInnerHTML={{ __html: JSON.stringify(data) }} />;\n',
+    'lib/db.ts': [
+      "const a = await prisma.$queryRawUnsafe(`SELECT * FROM users WHERE email = '${email}'`);",
+      'const b = await pool.query(`select * from orders where id = ${req.query.id}`);',
+      'const c = await pool.query("select * from t where name = \'" + name + "\'");',
+      'const d = await prisma.$queryRaw`SELECT * FROM users WHERE id = ${id}`;',
+      "const e = await pool.query('select * from t where id = $1', [id]);",
+    ].join('\n'),
+  });
+  assert.deepEqual(
+    (await scan(root)).findings.map((f) => `${f.ruleId} ${f.file}:${f.line}`).sort(),
+    ['sql-injection lib/db.ts:1', 'sql-injection lib/db.ts:2', 'sql-injection lib/db.ts:3', 'xss-unsanitized-html components/Bio.tsx:1'],
+  );
+});
+
+test('.env files: flags committed secrets, ignores gitignored, template and public-only files', async () => {
+  const root = makeRepo(
+    {
+      '.gitignore': '.env.local\n',
+      '.env': 'OPENAI_API_KEY=abc123\nVITE_SUPABASE_URL=https://x.supabase.co\n',
+      '.env.local': 'STRIPE_SECRET_KEY=abc\n',
+      '.env.example': 'OPENAI_API_KEY=\n',
+      'web/.env': 'VITE_SUPABASE_URL=https://x.supabase.co\nVITE_SUPABASE_PUBLISHABLE_KEY=abc\n',
+    },
+    { git: true },
+  );
+  const result = await scan(root);
+  assert.deepEqual(hits(result), ['env-file-committed .env']);
+  assert.match(result.findings[0].message, /`OPENAI_API_KEY`/);
+  assert.doesNotMatch(result.findings[0].message, /abc123/);
+});
+
+test('shipwarden-ignore comments and ignore globs', async () => {
+  const root = makeRepo({
+    '.shipwardenignore': '# fixtures\nfixtures/\n',
+    'components/A.tsx': '// shipwarden-ignore: content is from our CMS\nexport const A = ({ x }) => <div dangerouslySetInnerHTML={{ __html: x }} />;\n',
+    'components/B.tsx': '// shipwarden-ignore sql-injection\nexport const B = ({ x }) => <div dangerouslySetInnerHTML={{ __html: x }} />;\n',
+    'components/C.tsx': 'export const C = ({ x }) => <div dangerouslySetInnerHTML={{ __html: x }} />; // shipwarden-ignore xss-unsanitized-html\n',
+    'fixtures/D.tsx': 'export const D = ({ x }) => <div dangerouslySetInnerHTML={{ __html: x }} />;\n',
+    'other/E.tsx': 'export const E = ({ x }) => <div dangerouslySetInnerHTML={{ __html: x }} />;\n',
+  });
+  assert.deepEqual(hits(await scan(root, { ignore: ['other/**'] })), ['xss-unsanitized-html components/B.tsx']);
+});
+
+test('a well-built app produces no findings', async () => {
+  const root = makeRepo(
+    {
+      '.gitignore': '.env.local\n',
+      'package.json': supabasePkg,
+      '.env.local': 'SUPABASE_SERVICE_ROLE_KEY=secret\n',
+      '.env.example': 'NEXT_PUBLIC_SUPABASE_URL=\nNEXT_PUBLIC_SUPABASE_ANON_KEY=\nSUPABASE_SERVICE_ROLE_KEY=\n',
+      'supabase/migrations/1_init.sql': `create table public.profiles (id uuid primary key references auth.users, bio text);
+alter table public.profiles enable row level security;
+create policy "read own" on public.profiles for select using (auth.uid() = id);
+create policy "update own" on public.profiles for update using (auth.uid() = id) with check (auth.uid() = id);
+create view public.my_profile with (security_invoker = true) as select * from profiles where id = auth.uid();
+`,
+      'lib/supabase.ts': `export const anonKey = "${supabaseJwt('anon')}";\n`,
+      'app/api/account/route.ts': `import { createClient } from '@supabase/supabase-js';\nconst admin = createClient(url, process.env.SUPABASE_SERVICE_ROLE_KEY);\nexport async function DELETE() {\n  const { data: { user } } = await supabase.auth.getUser();\n  if (!user) return new Response(null, { status: 401 });\n  await admin.auth.admin.deleteUser(user.id);\n}\n`,
+      'app/api/stripe/webhook/route.ts': `import Stripe from 'stripe';\nexport async function POST(req) {\n  const event = stripe.webhooks.constructEvent(await req.text(), req.headers.get('stripe-signature'), process.env.STRIPE_WEBHOOK_SECRET);\n}\n`,
+      'middleware.ts': 'export async function middleware() {\n  await supabase.auth.getUser();\n}\n',
+      'components/Post.tsx': "import DOMPurify from 'isomorphic-dompurify';\nexport const P = ({ html }) => <div dangerouslySetInnerHTML={{ __html: DOMPurify.sanitize(html) }} />;\n",
+      'firestore.rules': `service cloud.firestore {\n  match /databases/{database}/documents {\n    match /users/{userId} {\n      allow read, write: if request.auth != null && request.auth.uid == userId;\n    }\n  }\n}\n`,
+    },
+    { git: true },
+  );
+  assert.deepEqual(hits(await scan(root)), []);
+});
+
+test('globToRegExp follows .gitignore conventions', () => {
+  assert.ok(globToRegExp('fixtures/').test('fixtures/a/b.ts'));
+  assert.ok(globToRegExp('*.min.js').test('public/vendor/app.min.js'));
+  assert.ok(globToRegExp('src/**/*.test.ts').test('src/a/b/c.test.ts'));
+  assert.ok(globToRegExp('src/**/*.test.ts').test('src/c.test.ts'));
+  assert.ok(!globToRegExp('src/*.ts').test('src/a/b.ts'));
+  assert.ok(!globToRegExp('dist').test('distribution/a.js'));
+});
+
+test('Supabase: RLS enabled in DO blocks and loops counts; backup SQL is not replayed', async () => {
+  const root = makeRepo({
+    'package.json': supabasePkg,
+    'supabase/migrations/1_init.sql': `create table public.a (id int);
+create table public.b (id int);
+create table public.c (id int);
+create table public.d (id int);
+do $$ declare t text; begin
+  foreach t in array array['a', 'b'] loop
+    execute format('alter table public.%I enable row level security', t);
+  end loop;
+end $$;
+do $$ begin alter table public.c enable row level security; exception when others then null; end $$;
+`,
+    'supabase/migrations/2_more.sql': `create table public.e (id int);
+create table public.f (id int);
+do $$ declare r record; begin
+  for r in select tablename from pg_tables where schemaname = 'public' loop
+    execute format('alter table public.%I enable row level security', r.tablename);
+  end loop;
+end $$;
+create table public.g (id int);
+`,
+    'docs/backup.sql': 'drop table public.g;\nalter table public.d enable row level security;\n',
+  });
+  const rls = (await scan(root)).findings.filter((f) => f.ruleId === 'supabase-rls-disabled').map((f) => f.title);
+  assert.deepEqual(rls, ['Row Level Security is off for table `g`']);
+});
+
+test('Secrets: no alarms for docs, regex literals or PEM headers built at runtime', async () => {
+  const key = ['AKIA', 'Q7ZKB2M4XW9RT3NP'].join('');
+  const PEM_HEADER = ['-----BEGIN', 'PRIVATE', 'KEY-----'].join(' ');
+  const root = makeRepo({
+    'docs/setup.md': `Export it: AWS_ACCESS_KEY_ID=${key}\n`,
+    'scripts/scan.mjs': `const ALLOW = [/${key}/];\n`,
+    'scripts/sign.mjs': `const pem = '${PEM_HEADER}\\n' + Buffer.from(der).toString('base64');\n`,
+    'server/keys.js': `const pem = "${PEM_HEADER}\\n${'MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQC'.repeat(2)}\\n${PEM_HEADER.replace('BEGIN', 'END')}";\nconst id = "${key}";\n`,
+  });
+  assert.deepEqual(
+    (await scan(root)).findings.map((f) => `${f.file}:${f.line} ${f.title}`),
+    ['server/keys.js:1 Private key committed to the repo', 'server/keys.js:2 AWS access key committed to the repo'],
+  );
+});
+
+test('Firebase: public storage reads are medium, and titles match the granted access', async () => {
+  const root = makeRepo({
+    'storage.rules': `service firebase.storage {
+  match /b/{bucket}/o {
+    match /{allPaths=**} {
+      allow read;
+      allow write: if request.auth.uid != null;
+    }
+  }
+}`,
+  });
+  assert.deepEqual(
+    (await scan(root)).findings.map((f) => `${f.severity} ${f.title}`),
+    ['high Any signed-in user can write to your whole Storage bucket', 'medium Anyone can read every file in your Storage bucket'],
+  );
+});
+
+test('Supabase: partitions without RLS are grouped into one finding per parent', async () => {
+  const root = makeRepo({
+    'package.json': supabasePkg,
+    'supabase/migrations/1.sql': `create table public.events (id int, at date) partition by range (at);
+alter table public.events enable row level security;
+create table public.events_2027_01 partition of public.events for values from ('2027-01-01') to ('2027-02-01');
+create table public.events_2027_02 partition of public.events for values from ('2027-02-01') to ('2027-03-01');
+`,
+  });
+  const titles = (await scan(root)).findings.map((f) => `${f.file}:${f.line} ${f.title}`);
+  assert.deepEqual(titles, ['supabase/migrations/1.sql:3 Row Level Security is off for 2 partitions of `events`']);
+});

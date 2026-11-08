@@ -1,0 +1,46 @@
+{
+  "name": "shipwarden",
+  "version": "0.1.0",
+  "description": "Free security scanner for apps built with Lovable, Bolt, Cursor and v0: Supabase RLS, Firebase rules, leaked keys, unprotected endpoints.",
+  "homepage": "https://github.com/patrickballard/shipwarden#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/patrickballard/shipwarden.git"
+  },
+  "bugs": {
+    "url": "https://github.com/patrickballard/shipwarden/issues"
+  },
+  "type": "module",
+  "bin": {
+    "shipwarden": "src/cli.js"
+  },
+  "files": [
+    "src",
+    "action.yml",
+    "README.md"
+  ],
+  "scripts": {
+    "test": "node --test test/*.test.js",
+    "scan": "node src/cli.js"
+  },
+  "keywords": [
+    "security",
+    "supabase",
+    "rls",
+    "firebase",
+    "nextjs",
+    "lovable",
+    "bolt",
+    "cursor",
+    "vibe-coding",
+    "github-action",
+    "secrets"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "license": "MIT",
+  "dependencies": {
+    "@anthropic-ai/sdk": "^1.6.0"
+  }
+}

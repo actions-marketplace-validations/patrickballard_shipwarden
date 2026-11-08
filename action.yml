@@ -1,0 +1,59 @@
+name: ShipWarden
+description: Free security checks for apps built with Lovable, Bolt, Cursor & co. on Supabase, Firebase and Next.js
+branding:
+  icon: shield
+  color: green
+
+inputs:
+  github-token:
+    description: Token used to read the PR's changed files and post the summary comment
+    default: ${{ github.token }}
+  fail-on:
+    description: Fail the check when a finding is at least this severe (critical, high, medium, low, none)
+    default: critical
+  scope:
+    description: "On pull requests: report only on files the PR changed (changed) or on the whole repo (all)"
+    default: changed
+  comment:
+    description: Post (and keep updating) one summary comment on the pull request
+    default: 'true'
+  ignore:
+    description: Extra glob patterns to skip, comma or newline separated (also reads .shipwardenignore)
+    default: ''
+  anthropic-api-key:
+    description: Optional. Lets Claude double-check uncertain findings and drop false positives
+    default: ''
+  ai-model:
+    description: Claude model used when anthropic-api-key is set
+    default: claude-opus-5-5
+
+outputs:
+  findings:
+    description: Number of findings reported
+    value: ${{ steps.scan.outputs.findings }}
+  critical:
+    description: Number of critical findings
+    value: ${{ steps.scan.outputs.critical }}
+  high:
+    description: Number of high findings
+    value: ${{ steps.scan.outputs.high }}
+
+runs:
+  using: composite
+  steps:
+    - name: Install AI review dependency
+      if: inputs.anthropic-api-key != ''
+      shell: bash
+      run: npm install --omit=dev --no-audit --no-fund --prefix "$GITHUB_ACTION_PATH" > /dev/null
+    - name: Scan
+      id: scan
+      shell: bash
+      run: node "$GITHUB_ACTION_PATH/src/action.js"
+      env:
+        INPUT_GITHUB_TOKEN: ${{ inputs.github-token }}
+        INPUT_FAIL_ON: ${{ inputs.fail-on }}
+        INPUT_SCOPE: ${{ inputs.scope }}
+        INPUT_COMMENT: ${{ inputs.comment }}
+        INPUT_IGNORE: ${{ inputs.ignore }}
+        INPUT_ANTHROPIC_API_KEY: ${{ inputs.anthropic-api-key }}
+        INPUT_AI_MODEL: ${{ inputs.ai-model }}
