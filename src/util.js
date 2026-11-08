@@ -116,3 +116,72 @@ export function isServerEndpoint(file) {
     (/\.[cm]?[jt]sx?$/.test(file.path) && hasDirective(file.content, 'use server'))
   );
 }
+
+const SOURCE_EXT = ['', '.ts', '.tsx', '.js', '.jsx', '.mjs', '/index.ts', '/index.tsx', '/index.js'];
+
+function normalize(p) {
+  const out = [];
+  for (const part of p.split('/')) {
+    if (part === '..') out.pop();
+    else if (part && part !== '.') out.push(part);
+  }
+  return out.join('/');
+}
+
+/** The scanned file an import specifier points at: relative paths and the `@/` / `~/` aliases. */
+function resolveImport(from, spec, ctx) {
+  let bases;
+  if (spec.startsWith('.')) {
+    bases = [normalize(`${from.split('/').slice(0, -1).join('/')}/${spec}`)];
+  } else if (/^[@~]\//.test(spec)) {
+    // The alias points at the app root or its src/; in a monorepo that's the nearest package.json.
+    const dirs = from.split('/').slice(0, -1);
+    const roots = [''];
+    for (let i = 1; i <= dirs.length; i++) {
+      const dir = dirs.slice(0, i).join('/');
+      if (ctx.files.has(`${dir}/package.json`)) roots.unshift(`${dir}/`);
+    }
+    bases = roots.flatMap((r) => [`${r}${spec.slice(2)}`, `${r}src/${spec.slice(2)}`]);
+  } else {
+    return null;
+  }
+  for (const base of bases) for (const ext of SOURCE_EXT) if (ctx.files.has(base + ext)) return base + ext;
+  return null;
+}
+
+/** The source of one top-level function or const in a file, up to the next top-level declaration. */
+function definition(content, name) {
+  const m = new RegExp(String.raw`^(?:export\s+)?(?:(?:async\s+)?function\s*\*?\s*${name}\b|(?:const|let)\s+${name}\s*[=:])`, 'm').exec(content);
+  if (!m) return null;
+  const rest = content.slice(m.index + m[0].length);
+  const next = /\n(?:export\s|(?:async\s+)?function\s|const\s|let\s|class\s)/.exec(rest);
+  return m[0] + rest.slice(0, next ? next.index : 4000);
+}
+
+/**
+ * Local helpers this file imports and calls, with their source, following one re-export:
+ * `requireActor()` from `@/lib/auth` comes back as the text of `requireActor` in lib/auth.ts.
+ */
+export function importedHelpers(file, ctx) {
+  if (!ctx?.files) return [];
+  const body = file.content.replace(/^\s*import\b[\s\S]*?from\s*['"][^'"]+['"];?/gm, '');
+  const out = [];
+  for (const m of file.content.matchAll(/^\s*import\s+(?:type\s+)?([\w$]+)?\s*,?\s*(?:\{([^}]*)\})?\s*from\s*['"]([^'"]+)['"]/gm)) {
+    const names = [m[1], ...(m[2] ?? '').split(',').map((p) => p.trim().replace(/^type\s+/, ''))].filter(Boolean);
+    const target = resolveImport(file.path, m[3], ctx);
+    if (!target) continue;
+    for (const spec of names) {
+      const [imported, local = imported] = spec.replace(/\$/g, '\\$').split(/\s+as\s+/);
+      if (!new RegExp(String.raw`\b${local}\s*\(`).test(body)) continue;
+      let source = ctx.files.get(target);
+      let def = imported === m[1] ? /export\s+default\b[\s\S]*/.exec(source)?.[0] : definition(source, imported);
+      const reexport = !def && new RegExp(String.raw`export\s*\{[^}]*\b${imported}\b[^}]*\}\s*from\s*['"]([^'"]+)['"]`).exec(source);
+      if (reexport) {
+        const next = resolveImport(target, reexport[1], ctx);
+        if (next) def = definition(ctx.files.get(next), imported);
+      }
+      if (def) out.push({ name: local, source: def });
+    }
+  }
+  return out;
+}

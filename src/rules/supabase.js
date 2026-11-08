@@ -14,6 +14,7 @@ const STATEMENTS = {
   createFunction: new RegExp(String.raw`\bcreate\s+(?:or\s+replace\s+)?(?:function|procedure)\s+${QNAME}\s*\((?<rest>[^;]*)`, 'gi'),
   alterFunction: new RegExp(String.raw`\balter\s+(?:function|procedure)\s+${QNAME}(?<rest>[^;]*)`, 'gi'),
   dropFunction: new RegExp(String.raw`\bdrop\s+(?:function|procedure)\s+(?:if\s+exists\s+)?${QNAME}`, 'gi'),
+  grant: /\b(?<verb>grant|revoke)\s+(?<privs>[\w\s,]*?)\s+on\s+(?<targets>[^;]*?)\s+(?:to|from)\s+(?<roles>[^;]+)/gi,
 };
 
 // Matched with DO-block bodies kept: Lovable/AI migrations often wrap these in `DO $$ BEGIN ... END $$`.
@@ -89,6 +90,27 @@ export function cleanSql(sql, { keepBodies = false } = {}) {
 function parseName(raw) {
   const parts = raw.match(/"[^"]+"|[A-Za-z_][\w$]*/g).map((p) => (p.startsWith('"') ? p.slice(1, -1) : p.toLowerCase()));
   return parts.length > 1 ? { schema: parts[0], name: parts[1] } : { schema: 'public', name: parts[0] };
+}
+
+/** Apply `grant/revoke select on <views> to/from anon, authenticated` to the views it names. */
+function applyGrant(views, m) {
+  const { verb, privs, targets, roles } = m.groups;
+  if (!/\b(select|all)\b/i.test(privs)) return;
+  const who = roles
+    .replace(/\b(cascade|restrict|with\s+grant\s+option|granted\s+by\s+\w+)\b/gi, '')
+    .split(',')
+    .map((r) => r.trim().replace(/"/g, '').toLowerCase())
+    .filter((r) => r === 'anon' || r === 'authenticated');
+  const schemaWide = /\ball\s+tables\s+in\s+schema\s+((?:"[^"]+"|\w+)(?:\s*,\s*(?:"[^"]+"|\w+))*)/i.exec(targets);
+  const hit = schemaWide
+    ? [...views.values()].filter((v) => schemaWide[1].split(',').map((n) => n.trim().replace(/"/g, '').toLowerCase()).includes(v.schema))
+    : targets
+        .replace(/^\s*table\s+/i, '')
+        .split(',')
+        .map((t) => (/^\s*(?:"[^"]+"|[A-Za-z_][\w$]*)(?:\s*\.\s*(?:"[^"]+"|[A-Za-z_][\w$]*))?\s*$/.test(t) ? parseName(t) : null))
+        .map((t) => t && views.get(`${t.schema}.${t.name}`))
+        .filter(Boolean);
+  for (const view of hit) for (const role of who) view.revoked[verb.toLowerCase() === 'revoke' ? 'add' : 'delete'](role);
 }
 
 function invokerOn(opts) {
@@ -204,6 +226,10 @@ function analyze(files) {
   const policies = new Map();
   const functions = new Map();
   for (const { kind, m, file, d } of events) {
+    if (kind === 'grant') {
+      applyGrant(views, m);
+      continue;
+    }
     if (kind === 'dynamicRls') {
       for (const t of tables.values()) if (t.schema === 'public' && (d.all || d.names.includes(t.name.toLowerCase()))) t.rls = true;
       continue;
@@ -225,7 +251,9 @@ function analyze(files) {
       tables.set(key, table);
     } else if (kind === 'createView') {
       const withOpts = /^\s*with\s*\(([^)]*)\)/i.exec(m.groups.rest)?.[1];
-      views.set(key, { schema, name, materialized: !!m.groups.mat, invoker: invokerOn(withOpts), ...loc });
+      // `create or replace` keeps the view's grants.
+      const revoked = views.get(key)?.revoked ?? new Set();
+      views.set(key, { schema, name, materialized: !!m.groups.mat, invoker: invokerOn(withOpts), body: m.groups.rest, revoked, ...loc });
     } else if (kind === 'alterView') {
       const view = views.get(key);
       if (view && invokerOn(m.groups.opts)) view.invoker = true;
@@ -342,6 +370,9 @@ export const permissivePolicy = {
   },
 };
 
+// The view's own query limits rows to the caller: often a deliberate column-hiding view.
+const FILTERS_CALLER = /\bauth\s*\.\s*(?:uid|jwt|role)\s*\(|current_setting\s*\(\s*'request\.jwt|\bwhere\b[\s\S]*\b\w*(?:user|member|tenant|access|owner|can_|is_|has_)\w*\s*\(/i;
+
 export const unsafeView = {
   id: 'supabase-view-bypasses-rls',
   title: 'View bypasses Row Level Security',
@@ -351,15 +382,36 @@ export const unsafeView = {
     const findings = [];
     for (const v of analyze(files).views.values()) {
       if (v.schema !== 'public' || v.invoker) continue;
+      const anonRevoked = v.revoked.has('anon');
+      if (anonRevoked && v.revoked.has('authenticated')) continue;
+      const fix = v.materialized
+        ? `Move it to a schema that isn't exposed (e.g. \`private\`), or revoke access: \`revoke select on public.${v.name} from anon, authenticated;\``
+        : `Recreate it with \`create view public.${v.name} with (security_invoker = true) as ...\` (Postgres 15+), or \`alter view public.${v.name} set (security_invoker = true);\``;
+      // A materialized view's filter runs at refresh time, not per caller, so it doesn't count.
+      const filtered = !v.materialized && FILTERS_CALLER.test(v.body ?? '');
+      if (filtered || anonRevoked) {
+        findings.push(
+          makeFinding(this, v.file, v.line, {
+            severity: 'low',
+            confidence: 'medium',
+            title: filtered
+              ? `Check that view \`${v.name}\` only returns the caller's rows`
+              : `Any logged-in user can read every row of view \`${v.name}\``,
+            message: filtered
+              ? `\`${v.name}\` skips the RLS policies on the tables it reads, but its own query filters by the current user, so this is probably deliberate (for example a view that hides some columns). Make sure that filter covers every row it can return.`
+              : `Logged-out visitors can't query \`${v.name}\` (anon access is revoked), but it still skips the RLS policies on the tables it reads, so any signed-in user can read every row, including other users' and other teams'. That's fine if the data is meant to be shared.`,
+            fix,
+          }),
+        );
+        continue;
+      }
       findings.push(
         makeFinding(this, v.file, v.line, {
           title: `View \`${v.name}\` bypasses Row Level Security`,
           message: v.materialized
             ? `Materialized views ignore RLS, and \`${v.name}\` is in the \`public\` schema, so anyone with your anon key can read all of it through the API.`
             : `Views run with their creator's permissions by default, so \`${v.name}\` ignores the RLS policies on the tables it reads and anyone with your anon key can query it.`,
-          fix: v.materialized
-            ? `Move it to a schema that isn't exposed (e.g. \`private\`), or revoke access: \`revoke select on public.${v.name} from anon, authenticated;\``
-            : `Recreate it with \`create view public.${v.name} with (security_invoker = true) as ...\` (Postgres 15+), or \`alter view public.${v.name} set (security_invoker = true);\``,
+          fix,
         }),
       );
     }

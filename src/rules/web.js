@@ -1,23 +1,42 @@
-import { EDGE_FUNCTION, ROUTE_HANDLER, hasDirective, isServerEndpoint, lineAt, looksLikePlaceholder, makeFinding } from '../util.js';
+import { EDGE_FUNCTION, ROUTE_HANDLER, hasDirective, importedHelpers, isServerEndpoint, lineAt, looksLikePlaceholder, makeFinding } from '../util.js';
 
 const MUTATING_EXPORT = /export\s+(?:async\s+)?function\s+(POST|PUT|PATCH|DELETE)\b|export\s+const\s+(POST|PUT|PATCH|DELETE)\s*=|\bas\s+(POST|PUT|PATCH|DELETE)\b/;
 
 const AUTH_CHECK = new RegExp(
   [
-    String.raw`\b(?:getUser|getClaims|getSession|getServerSession|getServerAuthSession|currentUser|getAuth|verifyIdToken|verifySessionCookie|validateRequest|getToken|getKindeServerSession|jwtVerify|constructEvent|constructEventAsync|verifyWebhook|timingSafeEqual)\s*\(`,
-    String.raw`\b(?:require|check|ensure|assert|verify|with|is)(?:Auth|Authenticated|User|Admin|Session|Signature)\w*\s*\(`,
+    String.raw`\b(?:getUser|getClaims|getSession|getServerSession|getServerAuthSession|currentUser|getAuth|verifyIdToken|verifySessionCookie|validateRequest|getToken|getKindeServerSession|jwtVerify|constructEvent|constructEventAsync|verifyWebhook|timingSafeEqual|verifyOtp|exchangeCodeForSession)\s*\(`,
+    String.raw`\b(?:require|check|ensure|assert|verify|validate|with|is)(?:Auth|Authenticated|User|Admin|Session|Signature)\w*\s*\(`,
     String.raw`\bauth\s*\(\s*\)`,
     String.raw`\.protect\s*\(`,
     String.raw`\bjwt\.verify\s*\(`,
     String.raw`(?:===|!==)\s*(?:process\.env|Deno\.env\.get)\b`,
     String.raw`[!=]==\s*\x60Bearer\s`,
-    String.raw`headers\.get\(\s*['"]x-[\w-]*(?:secret|token|key|signature)['"]\s*\)`,
+    // x-cal-signature-256, stripe-signature, svix-signature, x-hub-signature-256, x-cron-secret...
+    String.raw`headers(?:\.get\(\s*|\[\s*)['"](?:x-[\w-]*(?:secret|token|key)|[\w-]*signature[\w-]*)['"]\s*[)\]]`,
     String.raw`\.rpc\(\s*['"](?:has_role|is_admin|has_permission|check_\w+)['"]`,
   ].join('|'),
   'i',
 );
 const GUARD_NAME = /auth|guard|verif|require|protect|permission|assert|ensure|check/i;
 const CLIENT_FACTORY = /client$|^(create|get|new|init|make)\w*(client|supabase|stripe|db)/i;
+
+const IDENTITY = /user|actor|session|auth|member|tenant|account|principal|viewer|claims|role|permission|allowed|authori[sz]|access/i;
+const EARLY_EXIT = /const\s+(?:([\w$]+)|\{([^}]*)\})\s*=\s*await\s+([\w$]+)\s*\([^\n]*\n(?:\s*\n)?\s*if\s*\(\s*!\s*([\w$]+)(?:\??\.([\w$]+))?[^)\n]*\)\s*\{?\s*(?:return|throw|redirect\s*\(|notFound\s*\(|unauthorized\s*\(|forbidden\s*\()/g;
+
+/** `const gate = await requireActor(); if (!gate.actor) return ...`: a helper whose result gates the rest. */
+function exitsWithoutCaller(code) {
+  for (const m of code.matchAll(EARLY_EXIT)) {
+    const [, single, destructured, fn, checked, prop] = m;
+    const declared = single ? [single] : destructured.split(',').map((p) => p.split(':').pop().trim());
+    if (!declared.includes(checked) || CLIENT_FACTORY.test(fn)) continue;
+    if (IDENTITY.test(fn) || IDENTITY.test(prop ?? checked)) return true;
+  }
+  return false;
+}
+
+// Email-confirm and unsubscribe links: the unguessable token in the URL is the credential.
+const TOKEN_INPUT = /\.get\(\s*['"]\w*token['"]\s*\)|\b(?:searchParams|params|query|body)\??\.\w*token\b|\{[^}]*\b\w*token\b[^}]*\}\s*=\s*(?:await\s+)?(?:req|request|params|searchParams|body|context|props)\b/i;
+const TOKEN_LOOKUP = /\.(?:eq|match)\(\s*\{?\s*['"]?\w*token\w*['"]?\s*[,:]|where\s*:\s*\{[^}]*\b\w*token\w*\s*[:,}]|\b(?:verify|consume|validate|check|find)\w*Token\s*\(/i;
 
 /** Calls an auth helper it imports or defines, e.g. `await authorize(req)` from ../_shared/authorize.ts. */
 function callsGuardHelper(code) {
@@ -45,11 +64,13 @@ export const unauthenticatedWrite = {
   title: 'Endpoint changes data without checking who is calling',
   severity: 'medium',
   confidence: 'medium',
-  check(file) {
+  check(file, ctx) {
     if (!isServerEndpoint(file)) return [];
     const c = file.content;
     if (ROUTE_HANDLER.test(file.path) && !MUTATING_EXPORT.test(c)) return [];
-    if (AUTH_CHECK.test(c) || callsGuardHelper(c)) return [];
+    if (AUTH_CHECK.test(c) || callsGuardHelper(c) || exitsWithoutCaller(c) || (TOKEN_INPUT.test(c) && TOKEN_LOOKUP.test(c))) return [];
+    // The check lives in a helper this file imports, e.g. requireActor() in lib/auth.ts.
+    if (importedHelpers(file, ctx).some((h) => !CLIENT_FACTORY.test(h.name) && AUTH_CHECK.test(h.source))) return [];
 
     // A plain Supabase client is still protected by RLS; the admin client is not.
     const admin = ADMIN_CLIENT.test(c);
@@ -83,10 +104,11 @@ export const stripeWebhook = {
   message:
     "This Stripe webhook handler never checks the `Stripe-Signature` header, so anyone can send it a fake \"payment succeeded\" event and unlock paid features for free.",
   fix: "Verify every event: `const event = stripe.webhooks.constructEvent(rawBody, req.headers.get('stripe-signature'), process.env.STRIPE_WEBHOOK_SECRET)` (use `constructEventAsync` on Edge/Deno).",
-  check(file) {
+  check(file, ctx) {
     if (!/webhook/i.test(file.path) || !/\.[cm]?[jt]sx?$/.test(file.path)) return [];
     const c = file.content;
     if (!STRIPE_IMPORT.test(c) || /constructEvent/.test(c)) return [];
+    if (importedHelpers(file, ctx).some((h) => /constructEvent/.test(h.source))) return [];
     const handler = /export\s+(?:async\s+)?function\s+POST\b|export\s+const\s+POST\b|export\s+default|\bserve\s*\(|Deno\.serve\s*\(/.exec(c);
     return [makeFinding(this, file.path, handler ? lineAt(c, handler.index) : 1)];
   },
@@ -112,6 +134,28 @@ export const getSessionOnServer = {
   },
 };
 
+const LITERAL = /^(?:(['"`])(?:(?!\1)[^$\\]|\\.|\$(?!\{))*\1|-?\d[\d.]*|true|false|null|undefined)$/;
+
+/**
+ * Values that can't carry user input: a module-level constant, a constant string, or a function
+ * defined in this file called with only literal arguments (e.g. a CSS or JSON-LD builder).
+ */
+function isConstant(content, expr) {
+  const ref = /^([\w$]+)(?:\.[\w$]+)*$/.exec(expr);
+  if (ref) {
+    const name = ref[1].replace(/\$/g, '\\$');
+    if (new RegExp(String.raw`^(?:export\s+)?const\s+${name}\s*(?::[^=\n]+)?=`, 'm').test(content)) return true;
+    const local = new RegExp(String.raw`\bconst\s+${name}\s*(?::[^=\n]+)?=\s*([^;\n]+)`).exec(content);
+    return !!local && LITERAL.test(local[1].trim());
+  }
+  const call = /^([\w$]+)\(([^()]*)\)$/.exec(expr);
+  if (!call) return false;
+  const name = call[1].replace(/\$/g, '\\$');
+  const defined = new RegExp(String.raw`\bfunction\s+${name}\s*\(|\bconst\s+${name}\s*=\s*(?:async\s*)?(?:\([^)]*\)|[\w$]+)\s*=>`).test(content);
+  const args = call[2].trim() ? call[2].split(',').map((a) => a.trim()) : [];
+  return defined && args.every((a) => LITERAL.test(a) || new RegExp(String.raw`^(?:export\s+)?const\s+${a.replace(/\$/g, '\\$')}\s*[:=]`, 'm').test(content));
+}
+
 const SANITIZER = /DOMPurify|dompurify|sanitize-html|sanitizeHtml|isomorphic-dompurify|rehype-sanitize|\bxss\(/;
 
 export const unsafeHtml = {
@@ -124,7 +168,7 @@ export const unsafeHtml = {
     const findings = [];
     for (const m of file.content.matchAll(/dangerouslySetInnerHTML\s*=\s*\{\{\s*__html\s*:\s*([^}]*?)\s*\}\}/g)) {
       const expr = m[1];
-      if (/^(['"`])[^$]*\1$/.test(expr) || /JSON\.stringify|sanitiz|purify|escape/i.test(expr)) continue;
+      if (/^(['"`])[^$]*\1$/.test(expr) || /JSON\.stringify|sanitiz|purify|escape/i.test(expr) || isConstant(file.content, expr)) continue;
       findings.push(
         makeFinding(this, file.path, lineAt(file.content, m.index), {
           message: `\`${expr}\` is inserted as raw HTML. If any part of it comes from users (or from an AI model), an attacker can run JavaScript in other users' browsers and steal their sessions.`,

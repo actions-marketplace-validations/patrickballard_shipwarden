@@ -386,3 +386,78 @@ test('.env and public env rules ignore local-only values and commented-out lines
   );
   assert.deepEqual(hits(await scan(root)), ['env-file-committed api/.env']);
 });
+
+test('a mature Next.js + Supabase app: auth helpers, signed webhooks, token links, imports (issue #1)', async () => {
+  const admin = "import { createAdminClient } from '@/lib/supabase/admin';\n";
+  const root = makeRepo({
+    'package.json': supabasePkg,
+    'lib/supabase/admin.ts': "export function createAdminClient() {\n  return createClient(url, process.env.SUPABASE_SERVICE_ROLE_KEY);\n}\n",
+    'lib/actor.ts': "export async function getActor() {\n  const { data } = await supabase.auth.getUser();\n  return data.user;\n}\nexport const audit = (x) => log(x);\n",
+    'lib/index.ts': "export { getActor } from './actor';\n",
+    // 1. Auth in an imported helper (one re-export deep), or an unresolvable one gated by an early return.
+    'app/actions/notes.ts': `'use server'\n${admin}import { getActor } from '@/lib'\nexport async function save(x) {\n  await getActor()\n  await createAdminClient().from('notes').insert(x)\n}\n`,
+    'app/actions/teams.ts': `'use server';\n${admin}import { loadViewer } from '@acme/session';\nexport async function rename(x) {\n  const { viewer } = await loadViewer();\n  if (!viewer) return { error: 'Sign in' };\n  await createAdminClient().from('teams').update(x);\n}\n`,
+    // ...but a helper that isn't an auth check still gets flagged.
+    'app/actions/import.ts': `'use server';\n${admin}import { audit } from '@/lib/actor';\nexport async function importRows(x) {\n  const parsed = await parseRows(x);\n  if (!parsed) return;\n  audit(x);\n  await createAdminClient().from('rows').insert(parsed);\n}\n`,
+    // 2. A webhook that checks its own HMAC signature.
+    'app/api/cal/webhook/route.ts': `${admin}export async function POST(req) {\n  const sig = req.headers.get('x-cal-signature-256');\n  if (hmac(await req.text()) !== sig) return new Response(null, { status: 401 });\n  await createAdminClient().from('bookings').insert({});\n}\n`,
+    // 3. An unsubscribe link: the unguessable token is the credential.
+    'app/api/unsubscribe/route.ts': `${admin}export async function POST(req) {\n  const token = new URL(req.url).searchParams.get('token');\n  await createAdminClient().from('subscribers').update({ unsubscribed: true }).eq('unsubscribe_token', token);\n}\n`,
+    // 4. Stripe's signature check lives in an imported helper (src/ alias).
+    'src/lib/stripe.ts': "import Stripe from 'stripe';\nexport function verifyStripeEvent(body, sig) {\n  return stripe.webhooks.constructEvent(body, sig, process.env.STRIPE_WEBHOOK_SECRET);\n}\n",
+    'src/app/api/stripe/webhook/route.ts': "import { verifyStripeEvent } from '@/lib/stripe';\nexport async function POST(req) {\n  const event = verifyStripeEvent(await req.text(), req.headers.get('stripe-signature'));\n}\n",
+    'src/app/api/stripe/legacy-webhook/route.ts': "import { stripe } from '@/lib/stripe';\nexport async function POST(req) {\n  const event = await req.json();\n}\n",
+  });
+  assert.deepEqual(hits(await scan(root)), ['stripe-webhook-unverified src/app/api/stripe/legacy-webhook/route.ts', 'unauthenticated-write app/actions/import.ts']);
+});
+
+test('Supabase views: revoked grants and caller-filtered views (issue #1)', async () => {
+  const root = makeRepo({
+    'package.json': supabasePkg,
+    'supabase/migrations/1_views.sql': `create view public.open_stats as select count(*) from orders;
+create view public.member_names as select id, name from profiles;
+revoke select on public.member_names from anon;
+create view public.locked as select * from orders;
+revoke all on table public.locked from anon, authenticated;
+create view public.regranted as select * from orders;
+revoke all on public.regranted from anon, authenticated;
+grant select on public.regranted to authenticated;
+create view public.my_orders as select id, total from orders where user_id = auth.uid();
+create view public.team_docs as select d.id, d.title from docs d where is_team_member(d.team_id);
+create materialized view public.mv_filtered as select * from orders where user_id = auth.uid();
+`,
+  });
+  const views = (await scan(root)).findings.filter((f) => f.ruleId === 'supabase-view-bypasses-rls');
+  assert.deepEqual(
+    views.map((f) => [f.line, f.severity, f.title]),
+    [
+      [1, 'medium', 'View `open_stats` bypasses Row Level Security'],
+      [11, 'medium', 'View `mv_filtered` bypasses Row Level Security'],
+      [2, 'low', 'Any logged-in user can read every row of view `member_names`'],
+      [6, 'low', 'Any logged-in user can read every row of view `regranted`'],
+      [9, 'low', "Check that view `my_orders` only returns the caller's rows"],
+      [10, 'low', "Check that view `team_docs` only returns the caller's rows"],
+    ],
+  );
+});
+
+test('dangerouslySetInnerHTML: constants and local builders are fine, props are not (issue #1)', async () => {
+  const root = makeRepo({
+    'components/Theme.tsx': [
+      'const THEME_CSS = `:root { --brand: #0af; }`;',
+      'function themeScript() {',
+      '  return `document.documentElement.dataset.theme = localStorage.theme`;',
+      '}',
+      'const wrap = (html) => `<div>${html}</div>`;',
+      'export const A = () => <style dangerouslySetInnerHTML={{ __html: THEME_CSS }} />;',
+      'export const B = () => <script dangerouslySetInnerHTML={{ __html: themeScript() }} />;',
+      'export const C = ({ bio }) => <div dangerouslySetInnerHTML={{ __html: wrap(bio) }} />;',
+      'export const D = () => { const svg = "<svg></svg>"; return <i dangerouslySetInnerHTML={{ __html: svg }} />; };',
+      'export const E = ({ post }) => { const body = post.body; return <i dangerouslySetInnerHTML={{ __html: body }} />; };',
+    ].join('\n'),
+  });
+  assert.deepEqual(
+    (await scan(root)).findings.map((f) => `${f.ruleId}:${f.line}`),
+    ['xss-unsanitized-html:8', 'xss-unsanitized-html:10'],
+  );
+});

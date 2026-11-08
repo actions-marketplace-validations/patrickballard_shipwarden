@@ -56,6 +56,14 @@ test('a well-built Next.js app passes every applicable item', async () => {
   assert.deepEqual(result.checklist.filter((i) => !i.ok), []);
 });
 
+test('Next.js 404 pages under a locale segment or route group count (issue #1)', async () => {
+  const pkg = JSON.stringify({ dependencies: { next: '15.0.0' } });
+  for (const page of ['app/[locale]/not-found.tsx', 'src/app/(site)/not-found.tsx']) {
+    const result = await scan(makeRepo({ 'package.json': pkg, [page]: 'export default function NotFound() {}\n' }));
+    assert.equal(result.checklist.find((i) => i.id === 'not-found-page').ok, true, page);
+  }
+});
+
 test('libraries and CLIs get no checklist; opt-outs work', async () => {
   const lib = await scan(makeRepo({ 'package.json': JSON.stringify({ name: 'some-lib', dependencies: { zod: '3.0.0' } }), 'src/index.js': 'export const x = 1;\n' }));
   assert.deepEqual(lib.checklist, []);

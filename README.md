@@ -22,7 +22,7 @@ Try it on the bundled demo: `npx shipwarden examples/vulnerable-demo`
 |---|---|
 | Supabase table without Row Level Security | Your anon key is public, so every row is readable and writable by anyone. Migrations are replayed in order, including `DO` blocks and RLS loops. |
 | RLS policy with `using (true)` | The classic AI-written "System can manage X" policy: anyone can edit or delete everything. |
-| View or materialized view that bypasses RLS | Views run as their owner unless `security_invoker` is on. |
+| View or materialized view that bypasses RLS | Views run as their owner unless `security_invoker` is on. Views closed to `anon`, or that filter by `auth.uid()`, are reported as low "check this" items. |
 | Supabase Storage policy with no owner check | Lets anyone (or any logged-in user) overwrite or delete other people's files, upload to your buckets, or read private buckets. |
 | `security definer` function without a fixed `search_path` | It runs as its owner and skips RLS, so it should never look objects up through the caller's search_path. |
 | `service_role` key in the code | Decoded from the JWT itself, so the public `anon` key never triggers it. |
@@ -31,7 +31,7 @@ Try it on the bundled demo: `npx shipwarden examples/vulnerable-demo`
 | Hardcoded live keys | Stripe, OpenAI, Anthropic, Supabase secret keys, AWS, GitHub, Slack, SendGrid, private keys. |
 | Committed `.env` files | Only when they contain non-public values. |
 | Firebase rules: open, test mode, or "any signed-in user" catch-alls | Firestore, Storage and Realtime Database. |
-| API route, server action or Edge Function that writes data with no auth check | Especially when it uses the admin client, which skips RLS. |
+| API route, server action or Edge Function that writes data with no auth check | Especially when it uses the admin client, which skips RLS. Auth helpers in files you import, signed webhooks and token links (unsubscribe, email confirm) count as checks. |
 | Stripe webhook without signature verification | Anyone can fake a "payment succeeded" event. |
 | `supabase.auth.getSession()` trusted on the server | Supabase says to use `getUser()` there. |
 | Raw SQL built from string interpolation | SQL injection. |

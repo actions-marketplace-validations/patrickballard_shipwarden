@@ -116,7 +116,8 @@ function buildContext(files, tracked, paths) {
   if (usesFirebase) stack.push('Firebase');
   if (deps.has('stripe') || deps.has('@stripe/stripe-js')) stack.push('Stripe');
   if (deps.has('@prisma/client') || deps.has('prisma')) stack.push('Prisma');
-  return { tracked, deps, usesSupabase, usesFirebase, framework, kind, app, paths, stack };
+  const byPath = new Map(files.map((f) => [f.path, f.content]));
+  return { tracked, deps, usesSupabase, usesFirebase, framework, kind, app, paths, stack, files: byPath };
 }
 
 const IGNORE_COMMENT = /shipwarden-ignore(?:[\s:]+([\w-]+(?:\s*,\s*[\w-]+)*))?/;

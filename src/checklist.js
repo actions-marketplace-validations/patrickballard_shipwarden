@@ -58,7 +58,8 @@ export const CHECKS = [
     priority: (s, ctx) => (ctx.kind === 'spa' ? 'must' : 'should'),
     check(files, ctx) {
       const byKind = {
-        next: /(^|\/)(src\/)?app\/not-found\.[jt]sx?$|(^|\/)(src\/)?pages\/404\.[jt]sx?$/,
+        // app/[locale]/not-found.tsx (next-intl) and route groups like app/(site)/not-found.tsx count too.
+        next: /(^|\/)(src\/)?app\/(?:[[(][^/]+[\])]\/)*not-found\.[jt]sx?$|(^|\/)(src\/)?pages\/404\.[jt]sx?$/,
         sveltekit: /(^|\/)src\/routes\/\+error\.svelte$/,
         nuxt: /(^|\/)error\.vue$/,
         astro: /(^|\/)src\/pages\/404\.(astro|mdx?|html)$/,
