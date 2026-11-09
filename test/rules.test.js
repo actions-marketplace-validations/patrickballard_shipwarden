@@ -1,4 +1,6 @@
 import { test } from 'node:test';
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
 import assert from 'node:assert/strict';
 import { scan } from '../src/scanner.js';
 import { globToRegExp } from '../src/util.js';
@@ -373,6 +375,77 @@ create function b() returns void language sql security definer as $$ select 1 $$
       "2_fix.sql:3 low 2 functions run with their owner's privileges but have no fixed search_path",
     ],
   );
+});
+
+test('Supabase: SECURITY DEFINER functions that take a user ID from the caller', async () => {
+  const root = makeRepo({
+    'package.json': supabasePkg,
+    'supabase/migrations/1_fns.sql': `create or replace function public.award_points(p_user_id uuid, amount int)
+returns void language plpgsql security definer set search_path = public as $$
+begin
+  update public.profiles set points = points + amount where id = p_user_id;
+end;
+$$;
+create function public.get_orders(_user_id uuid) returns setof public.orders
+language sql security definer set search_path = public as $$ select * from public.orders where user_id = _user_id $$;
+create function public.has_role(_user_id uuid, _role text) returns boolean
+language sql stable security definer set search_path = public as $$ select exists (select 1 from public.user_roles where user_id = _user_id and role = _role) $$;
+create function public.checked(target_user_id uuid) returns void language plpgsql security definer set search_path = public as $$
+begin
+  if target_user_id <> auth.uid() then raise exception 'not allowed'; end if;
+  delete from public.notes where user_id = target_user_id;
+end;
+$$;
+create function public.backend_only(user_id uuid) returns void language sql security definer set search_path = public as $$ delete from public.notes where notes.user_id = user_id $$;
+revoke execute on function public.backend_only(uuid) from public, anon, authenticated;
+create function public.members_only(user_id uuid) returns json language sql security definer set search_path = public as $$ select row_to_json(p) from public.profiles p where p.id = user_id $$;
+revoke execute on function public.members_only from anon;
+create function public.public_only(user_id uuid) returns void language sql security definer set search_path = public as 'insert into public.log (uid) values (user_id)';
+revoke all on function public.public_only(uuid) from public;
+create function public.invoker(user_id uuid) returns void language sql set search_path = public as $$ delete from public.notes where notes.user_id = user_id $$;
+create function public.unused(user_id uuid) returns json language sql security definer set search_path = public as $$ select '{}'::json $$;
+create function public.on_signup() returns trigger language plpgsql security definer set search_path = public as $$ begin insert into public.profiles (id) values (new.id); return new; end; $$;
+create function public.later(p_user_id uuid) returns setof public.orders language sql security definer set search_path = public as $$ select * from public.orders where user_id = p_user_id $$;
+`,
+    'supabase/migrations/2_lockdown.sql': `create or replace function public.backend_only(user_id uuid) returns void language sql security definer set search_path = public as $$ delete from public.notes where notes.user_id = user_id $$;
+revoke execute on all functions in schema public from anon, authenticated;
+grant execute on function public.later(uuid) to authenticated;
+`,
+  });
+  assert.deepEqual(
+    (await scan(root)).findings.filter((f) => f.ruleId === 'supabase-rpc-user-param').map((f) => `${f.line} ${f.severity} ${f.title}`),
+    ["26 medium Any logged-in user can call `later` with someone else's `p_user_id`"],
+  );
+
+  // Before the lockdown migration.
+  const before = makeRepo({ 'package.json': supabasePkg, 'supabase/migrations/1_fns.sql': readFileSync(join(root, 'supabase/migrations/1_fns.sql'), 'utf8') });
+  assert.deepEqual(
+    (await scan(before)).findings.filter((f) => f.ruleId === 'supabase-rpc-user-param').map((f) => `${f.line} ${f.severity} ${f.title}`),
+    [
+      "1 high Anyone can call `award_points` with someone else's `p_user_id`",
+      "21 high Anyone can call `public_only` with someone else's `user_id`",
+      "7 medium Anyone can call `get_orders` with someone else's `_user_id`",
+      "19 medium Any logged-in user can call `members_only` with someone else's `user_id`",
+      "26 medium Anyone can call `later` with someone else's `p_user_id`",
+    ],
+  );
+});
+
+test('Supabase: policies written for the backend should be dropped, not limited to service_role', async () => {
+  const root = makeRepo({
+    'package.json': supabasePkg,
+    'supabase/migrations/1.sql': `create table public.orders (id int, user_id uuid);
+alter table public.orders enable row level security;
+create policy "System can manage orders" on public.orders for all using (true);
+create policy "Anyone can delete" on public.orders for delete using (true);
+create policy "Service role can insert orders" on public.orders for insert with check (true);
+`,
+  });
+  const fixes = (await scan(root)).findings.filter((f) => f.ruleId === 'supabase-permissive-policy').map((f) => `${f.line} ${f.fix}`);
+  assert.equal(fixes.length, 3);
+  assert.match(fixes[0], /^3 This policy looks meant for your backend.*`drop policy "System can manage orders" on public\.orders;`/);
+  assert.match(fixes[1], /^4 Replace `true` with an ownership check.*If it's only meant for your backend, drop it instead \(`drop policy "Anyone can delete" on public\.orders;`\)/);
+  assert.match(fixes[2], /^5 This policy looks meant for your backend.*`drop policy "Service role can insert orders" on public\.orders;`/);
 });
 
 test('.env and public env rules ignore local-only values and commented-out lines', async () => {
