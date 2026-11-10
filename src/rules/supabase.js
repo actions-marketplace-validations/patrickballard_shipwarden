@@ -92,15 +92,81 @@ function parseName(raw) {
   return parts.length > 1 ? { schema: parts[0], name: parts[1] } : { schema: 'public', name: parts[0] };
 }
 
-/** Apply `grant/revoke select on <views> to/from anon, authenticated` to the views it names. */
-function applyGrant(views, m) {
-  const { verb, privs, targets, roles } = m.groups;
-  if (!/\b(select|all)\b/i.test(privs)) return;
-  const who = roles
+/** The API roles (`anon`, `authenticated`) a grant or revoke names. */
+function apiRoles(roles) {
+  return roles
     .replace(/\b(cascade|restrict|with\s+grant\s+option|granted\s+by\s+\w+)\b/gi, '')
     .split(',')
     .map((r) => r.trim().replace(/"/g, '').toLowerCase())
     .filter((r) => r === 'anon' || r === 'authenticated');
+}
+
+/** Split on commas that aren't inside parentheses. */
+function splitTop(text) {
+  const out = [];
+  let depth = 0;
+  let start = 0;
+  for (let i = 0; i < text.length; i++) {
+    if (text[i] === '(') depth++;
+    else if (text[i] === ')') depth--;
+    else if (text[i] === ',' && !depth) {
+      out.push(text.slice(start, i));
+      start = i + 1;
+    }
+  }
+  out.push(text.slice(start));
+  return out;
+}
+
+/**
+ * Apply `grant/revoke execute on function f(...) to/from anon, authenticated`. Revoking from
+ * `public` alone doesn't count: Supabase grants execute to anon and authenticated explicitly.
+ */
+function applyFunctionGrant(functions, m) {
+  const { verb, privs, targets, roles } = m.groups;
+  if (!/\b(execute|all)\b/i.test(privs)) return;
+  const who = apiRoles(roles);
+  const schemaWide = /\ball\s+(?:functions|routines|procedures)\s+in\s+schema\s+((?:"[^"]+"|\w+)(?:\s*,\s*(?:"[^"]+"|\w+))*)/i.exec(targets);
+  let hit;
+  if (schemaWide) {
+    const schemas = schemaWide[1].split(',').map((n) => n.trim().replace(/"/g, '').toLowerCase());
+    hit = [...functions.values()].filter((f) => schemas.includes(f.schema));
+  } else {
+    if (!/^\s*(?:function|procedure|routine)\s/i.test(targets)) return;
+    hit = splitTop(targets.replace(/^\s*(?:function|procedure|routine)\s+/i, ''))
+      .map((t) => new RegExp(String.raw`^\s*(?:(?:function|procedure|routine)\s+)?${QNAME}`, 'i').exec(t))
+      .filter(Boolean)
+      .map((t) => {
+        const { schema, name } = parseName(t.groups.name);
+        return functions.get(`${schema}.${name}`);
+      })
+      .filter(Boolean);
+  }
+  for (const fn of hit) for (const role of who) fn.revoked[verb.toLowerCase() === 'revoke' ? 'add' : 'delete'](role);
+}
+
+const USER_PARAM = /^(?:p_|_|in_|arg_|target_|p_target_)?(?:user_?id|user_?uuid|uid|owner_?id|profile_?id|member_?id|author_?id|customer_?id)$/i;
+
+/** The arguments, return type and body of `create function name(` + rest, from the original SQL. */
+function signature(rest, raw) {
+  let depth = 1;
+  let i = 0;
+  for (; i < rest.length && depth; i++) depth += rest[i] === '(' ? 1 : rest[i] === ')' ? -1 : 0;
+  const args = splitTop(rest.slice(0, i - 1))
+    .map((a) => /^\s*(?:(?<mode>in|out|inout|variadic)\s+)?(?<name>"[^"]+"|[A-Za-z_][\w$]*)\s+(?<type>[^=]+?)\s*(?:(?:default|=)[\s\S]*)?$/i.exec(a)?.groups)
+    .filter((a) => a && !/^(in)?out$/i.test(a.mode ?? '') && !/^(?:in|out|inout|variadic)$/i.test(a.name))
+    .map((a) => ({ name: a.name.replace(/"/g, ''), type: a.type.trim().toLowerCase() }));
+  const ret = /\breturns\s+(?<setof>setof\s+)?(?<type>table|[\w."]+)/i.exec(rest.slice(i))?.groups;
+  const returns = ret?.type.replace(/"/g, '').toLowerCase() ?? 'void';
+  // `raw` is the whole statement and ends with `rest`, so this is everything after the argument list.
+  return { args, returns, setof: !!ret?.setof, body: raw.slice(raw.length - rest.length + i) };
+}
+
+/** Apply `grant/revoke select on <views> to/from anon, authenticated` to the views it names. */
+function applyGrant(views, m) {
+  const { verb, privs, targets, roles } = m.groups;
+  if (!/\b(select|all)\b/i.test(privs)) return;
+  const who = apiRoles(roles);
   const schemaWide = /\ball\s+tables\s+in\s+schema\s+((?:"[^"]+"|\w+)(?:\s*,\s*(?:"[^"]+"|\w+))*)/i.exec(targets);
   const hit = schemaWide
     ? [...views.values()].filter((v) => schemaWide[1].split(',').map((n) => n.trim().replace(/"/g, '').toLowerCase()).includes(v.schema))
@@ -228,6 +294,7 @@ function analyze(files) {
   for (const { kind, m, file, d } of events) {
     if (kind === 'grant') {
       applyGrant(views, m);
+      applyFunctionGrant(functions, m);
       continue;
     }
     if (kind === 'dynamicRls') {
@@ -260,12 +327,15 @@ function analyze(files) {
     } else if (kind === 'dropView') {
       views.delete(key);
     } else if (kind === 'createPolicy') {
-      policies.set(`${key}:${m.groups.policy}`, { schema, name, body: m.groups.body, ...loc });
+      policies.set(`${key}:${m.groups.policy}`, { schema, name, policy: m.groups.policy.replace(/^"|"$/g, ''), body: m.groups.body, ...loc });
     } else if (kind === 'dropPolicy') {
       policies.delete(`${key}:${m.groups.policy}`);
     } else if (kind === 'createFunction') {
       const { rest } = m.groups;
-      functions.set(key, { schema, name, definer: /\bsecurity\s+definer\b/i.test(rest), pinned: /\bset\s+search_path\b/i.test(rest), ...loc });
+      // `create or replace` keeps the function's grants.
+      const revoked = functions.get(key)?.revoked ?? new Set();
+      const sig = signature(rest, file.content.slice(m.index, m.index + m[0].length));
+      functions.set(key, { schema, name, definer: /\bsecurity\s+definer\b/i.test(rest), pinned: /\bset\s+search_path\b/i.test(rest), revoked, ...sig, ...loc });
     } else if (kind === 'alterFunction') {
       const fn = functions.get(key);
       if (!fn) continue;
@@ -328,6 +398,17 @@ export const rlsDisabled = {
   },
 };
 
+// "System can manage X", "Service role can insert": policies written for the backend.
+const BACKEND_POLICY = /\b(?:system|service|backend|server|internal|edge\s+functions?|webhooks?|cron|triggers?)\b/i;
+
+/** service_role skips RLS, so a policy meant for the backend does nothing but open the table up. */
+function policyFix(p, fix) {
+  const drop = `\`drop policy "${p.policy}" on public.${p.name};\``;
+  return BACKEND_POLICY.test(p.policy)
+    ? `This policy looks meant for your backend, which doesn't need one: the \`service_role\` key skips RLS. Drop it with ${drop}, then add per-user policies if the app itself needs access.`
+    : `${fix} If it's only meant for your backend, drop it instead (${drop}): the \`service_role\` key skips RLS, so the backend doesn't need a policy.`;
+}
+
 export const permissivePolicy = {
   id: 'supabase-permissive-policy',
   title: 'RLS policy allows everyone',
@@ -351,7 +432,7 @@ export const permissivePolicy = {
           makeFinding(this, p.file, p.line, {
             title: `RLS policy lets ${whoShort} ${verb} any row in \`${p.name}\``,
             message: `\`using (true)\` never checks who owns the row, so this policy lets ${who} ${verb} every row in \`${p.name}\`.`,
-            fix: 'Replace `true` with an ownership check, e.g. `using (auth.uid() = user_id) with check (auth.uid() = user_id)`.',
+            fix: policyFix(p, 'Replace `true` with an ownership check, e.g. `using (auth.uid() = user_id) with check (auth.uid() = user_id)`.'),
           }),
         );
       } else if (cmd === 'insert' && checkTrue) {
@@ -361,7 +442,7 @@ export const permissivePolicy = {
             confidence: 'medium',
             title: `RLS policy lets ${whoShort} insert anything into \`${p.name}\``,
             message: `\`with check (true)\` lets ${who} insert rows with any values, including someone else's \`user_id\`. Fine for a public form, risky for user-owned data.`,
-            fix: 'If rows belong to a user, use `with check (auth.uid() = user_id)`.',
+            fix: policyFix(p, 'If rows belong to a user, use `with check (auth.uid() = user_id)`.'),
           }),
         );
       }
@@ -515,4 +596,49 @@ export const definerSearchPath = {
   },
 };
 
-export default [rlsDisabled, permissivePolicy, unsafeView, storagePolicy, definerSearchPath];
+// Anything that ties the call to the signed-in user, or limits it to the backend.
+const CALLER_CHECK = /\bauth\s*\.\s*(?:uid|jwt|role)\s*\(|request\.jwt|\bservice_role\b/i;
+const WRITES = /\binsert\s+into\b|\bupdate\s+(?:only\s+)?(?:"[^"]+"|[\w$]+)(?:\s*\.\s*(?:"[^"]+"|[\w$]+))?\s+(?:as\s+\w+\s+|\w+\s+)?set\b|\bdelete\s+from\b/i;
+
+export const rpcUserParam = {
+  id: 'supabase-rpc-user-param',
+  title: 'SECURITY DEFINER function trusts a user ID passed by the caller',
+  severity: 'high',
+  checkAll(files, ctx) {
+    if (!ctx.usesSupabase) return [];
+    const findings = [];
+    const { functions, tables } = analyze(files);
+    for (const fn of functions.values()) {
+      if (!fn.definer || fn.schema !== 'public' || /trigger$/.test(fn.returns)) continue;
+      if (fn.revoked.has('anon') && fn.revoked.has('authenticated')) continue;
+      const param = fn.args.find((a) => USER_PARAM.test(a.name) && /^(uuid|text|varchar|character varying)\b/.test(a.type));
+      if (!param || CALLER_CHECK.test(fn.body)) continue;
+      // Without the argument name in the body the parameter is unused.
+      if (!new RegExp(String.raw`(?<![\w$])${param.name.replace(/\$/g, '\\$')}(?![\w$])`, 'i').test(fn.body)) continue;
+      const writes = WRITES.test(fn.body);
+      // Rows, tables or JSON. Scalar helpers like has_role(_user_id, _role) or get_user_role(_user_id) only reveal
+      // a yes/no or a role, and RLS policies call them with auth.uid().
+      const type = fn.returns.includes('.') ? fn.returns : `public.${fn.returns}`;
+      const returnsData = fn.setof || /^(table|json|jsonb|record)$/.test(fn.returns) || tables.has(type);
+      if (!writes && !returnsData) continue;
+      const who = fn.revoked.has('anon') ? 'any logged-in user' : 'anyone';
+      const Who = who[0].toUpperCase() + who.slice(1);
+      findings.push(
+        makeFinding(this, fn.file, fn.line, {
+          severity: writes ? 'high' : 'medium',
+          confidence: 'medium',
+          title: `${Who} can call \`${fn.name}\` with someone else's \`${param.name}\``,
+          message:
+            `\`${fn.name}\` is \`security definer\`, so it runs as its owner and skips Row Level Security, and it takes the user ID as an argument instead of reading \`auth.uid()\`. ` +
+            `${Who} can call \`supabase.rpc('${fn.name}', { ${param.name}: '<another user id>' })\` and ${writes ? "change that user's data" : "read that user's data"}.`,
+          fix:
+            `Remove the \`${param.name}\` argument and use \`auth.uid()\` inside the function. ` +
+            `If only your backend calls it, revoke access instead: \`revoke execute on function public.${fn.name} from public, anon, authenticated;\``,
+        }),
+      );
+    }
+    return findings;
+  },
+};
+
+export default [rlsDisabled, permissivePolicy, unsafeView, storagePolicy, definerSearchPath, rpcUserParam];
